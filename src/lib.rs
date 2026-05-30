@@ -24,8 +24,65 @@ pub mod replica_url;
 pub mod store;
 pub mod wal;
 
+// ── Crate-root re-exports — the ergonomic public surface (PLAN.md §4) ─────────
+//
+// These `pub use` aliases let a host write `rustyriver::Db`, `rustyriver::Replica`,
+// `rustyriver::restore`, `rustyriver::Leaser`, etc. without naming the owning
+// module. The original module paths (`rustyriver::db::Db`, …) remain valid; these
+// are additive aliases, not a relocation.
+
 // Re-export the error model at the crate root.
 pub use error::{new_ltx_error, Error, LTXError, Result};
+
+/// A SQLite database managed for replication (WAL-mode checkpoint takeover plus
+/// the WAL→LTX capture loop). Re-exported from [`crate::db::Db`].
+pub use db::Db;
+
+/// SQLite checkpoint mode used by [`Db`] when it checkpoints the WAL.
+/// Re-exported from [`crate::db::CheckpointMode`].
+pub use db::CheckpointMode;
+
+/// Connects a managed [`Db`] to a replication destination and drives the
+/// single-replica sync loop. Re-exported from [`crate::replica::Replica`].
+pub use replica::Replica;
+
+/// Restores a database from a [`ReplicaClient`] into a fresh file, optionally up
+/// to a target [`TXID`]. Re-exported from [`crate::replica::restore`].
+pub use replica::restore;
+
+/// The storage abstraction every replica backend implements.
+/// Re-exported from [`crate::client::ReplicaClient`].
+pub use client::ReplicaClient;
+
+/// Metadata describing a single LTX file on a replica (the value type returned by
+/// [`ReplicaClient`] listings). Re-exported from [`crate::ltx::FileInfo`].
+pub use ltx::FileInfo;
+
+/// A [`ReplicaClient`] that stores LTX files on the local filesystem.
+/// Re-exported from [`crate::client::file::FileReplicaClient`].
+pub use client::file::FileReplicaClient;
+
+/// The object-storage lease provider used for single-primary fencing.
+/// Re-exported from [`crate::leaser::Leaser`].
+pub use leaser::Leaser;
+
+/// The default S3-backed [`Leaser`] implementation (over the `object_store`
+/// crate). Re-exported from [`crate::leaser::S3Leaser`].
+pub use leaser::S3Leaser;
+
+/// A lease value (`generation` + `expires_at` + `owner`) read from or written to
+/// the lock object. Re-exported from [`crate::leaser::Lease`].
+pub use leaser::Lease;
+
+/// The S3/R2/MinIO [`ReplicaClient`], behind the `s3` feature.
+/// Re-exported from [`crate::client::object_store::ObjectStoreClient`].
+#[cfg(feature = "s3")]
+pub use client::object_store::ObjectStoreClient;
+
+/// Configuration for the S3/R2/MinIO backend, behind the `s3` feature.
+/// Re-exported from [`crate::client::object_store::ObjectStoreConfig`].
+#[cfg(feature = "s3")]
+pub use client::object_store::ObjectStoreConfig;
 
 // ── Naming constants ──────────────────────────────────────────────────────────
 
