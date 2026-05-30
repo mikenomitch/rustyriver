@@ -48,6 +48,72 @@ Non-blocking: crate/repo name `rustyriver`; no debug CLI in the one-shot.
 
 ## Escalations log (agent appends; newest first)
 
+### 2026-05-30 — T7 — ObjectStore (S3/R2/MinIO) client: DECISIONs + deferrals
+**Context:** `src/client/object_store.rs` (the S3/R2/MinIO `ReplicaClient`),
+`tests/integration_minio.rs`. Behavior ported from `s3/replica_client.go`; the
+transport is the **`object_store` crate** (feature `s3`), not the Go AWS SDK
+(D-5 / brief T7). No new runtime dependency — `object_store` is already in
+`Cargo.toml`.
+
+**DECISION — offset-past-EOF returns an empty slice (file-client parity, not Go
+parity).** A range request with `offset >= object_size` returns HTTP 416 from
+S3/MinIO. Go's `OpenLTXFile` would propagate that 416 as an error; our file
+client (T6) returns an empty `Vec` when `offset >= len`. T7 mirrors the **file
+client** so both backends are interchangeable under the shared
+`run_client_suite` (the T7 Definition of Done). No real read path ever requests a
+past-EOF offset — restore reads the in-bounds page-index tail — so this only
+affects the degenerate case; any non-416 read error still propagates.
+(`src/client/object_store.rs`, in `open_ltx_file` + `is_range_not_satisfiable`.)
+The 416 is detected by matching the rendered error string ("416" / "Range Not
+Satisfiable"), because `object_store 0.11` surfaces it as a `Generic` error with
+no dedicated variant; verified against live MinIO.
+
+**DECISION — `litestream-timestamp` stored as an `object_store` metadata
+attribute; round-tripped via a hand-rolled RFC3339Nano (no date crate).** Go
+writes `time.UnixMilli(hdr.Timestamp).UTC().Format(time.RFC3339Nano)` into S3
+object metadata and parses it back with `time.Parse(time.RFC3339Nano, …)`
+(s3/replica_client.go:671-681, 1435). We store it as
+`Attribute::Metadata("litestream-timestamp")` and (de)serialise the exact shape
+we write — `YYYY-MM-DDTHH:MM:SS[.fffffffff]Z` — with two small civil-date helpers
+(Howard Hinnant's algorithm), to avoid pulling in `chrono`/`time` (AGENTS.md rule
+7). This is sufficient because the `use_metadata` restore path only ever reads
+timestamps that this same client wrote. Round-trip + malformed-input rejection
+are unit-tested; the end-to-end metadata read is tested against live MinIO.
+
+**DECISION — multipart threshold implemented explicitly at 5 MiB.**
+`object_store 0.11` has **no** `with_multipart_threshold`; `put`/`put_opts` is a
+single PUT and `put_multipart_opts` is caller-driven. To match the Go uploader's
+5 MiB `PartSize` default (s3/replica_client.go:99, brief §5.1) we branch in
+`write_ltx_file`: `< 5 MiB` → single `put_opts`; `>= 5 MiB` → `put_multipart_opts`
+with fixed-size parts (each `>= 5 MiB` except the last, per object_store's part
+rule). Verified against live MinIO with a ~6 MiB incompressible LTX file
+(byte-exact round-trip + a byte-range read on the multipart object).
+
+**DECISION — `skip_verify` maps to `allow_http`.** `object_store` gates plaintext
+behind `with_allow_http`, with no TLS-verify toggle. We enable `allow_http` for
+`http://` endpoints, local endpoints, or when `skip_verify` is set. (Full TLS
+`SkipVerify` against an https self-signed endpoint is not reachable through
+object_store 0.11's public builder; not needed for the MinIO/file KEEP scope.)
+
+**DEFERRED (not on the KEEP functional path; logged, not built):**
+SSE-C / SSE-KMS request headers; payload-signing / `RequireContentMD5` /
+aws-chunked middleware assertions; Tigris consistent-read header; the
+`LITESTREAM_S3_DEBUG` env knob; access-point ARN *endpoint* wiring (ARN parsing
+into bucket/region IS ported). These are AWS-SDK-middleware concerns the
+`object_store` backend either handles internally or that only matter on native
+AWS; none affects MinIO conformance or the round-trip/restore correctness this
+task gates. The corresponding Go unit tests (httptest/smithy-mock) assert SDK
+wire details we don't control and were therefore not ported; the five
+`ReplicaClient` operations are fully real and exercised end-to-end against MinIO.
+
+**MinIO gate:** `tests/integration_minio.rs` runs the generic `run_client_suite`
+(+ the `use_metadata` timestamp path and the 5 MiB multipart boundary) against a
+real MinIO. It **auto-skips with a logged note** (TCP-reachability probe) when
+Docker/MinIO is unavailable, so it never blocks the gate; the pure-unit ports
+(ParseHost, R2 concurrency, URL query aliases, endpoint env var, key scheme,
+NotFound mapping, RFC3339Nano) cover the client regardless. In this run MinIO
+was up and all three live tests passed.
+
 ### 2026-05-30 — T10 — Replica sync+restore: compactor reimplementation (DECISION) + L0-only restore-plan + deferrals
 **Context:** `src/replica.rs` (the single-replica sync loop + restore). Ported from `replica.go`
 (+ ltx@v0.5.1 `compactor.go`/`decoder.go`). Drives G2.
