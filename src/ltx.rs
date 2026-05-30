@@ -41,7 +41,19 @@ fn corrupt(msg: impl Into<String>) -> Error {
 }
 
 /// Returns the lock page number for a given page size (ltx.go:494).
+///
+/// `page_size` is expected to be a validated SQLite page size (a power of two in
+/// `[512, 65536]`); for any such value the result is identical to Go's
+/// `LockPgno` (`PENDING_BYTE / page_size + 1`). A `page_size` of `0` — which
+/// only reaches here via an unvalidated/adversarial header — would make the
+/// underlying integer divide panic in both Go and Rust, so we guard it and
+/// return `0` (never a real page number) instead of dividing. All in-crate
+/// callers validate the header first, mirroring Go's `DecodeHeader`-before-
+/// `LockPgno` ordering, so this guard is reached only by a direct external call.
 pub fn lock_pgno(page_size: u32) -> u32 {
+    if page_size == 0 {
+        return 0;
+    }
     (PENDING_BYTE / page_size as i64) as u32 + 1
 }
 
@@ -391,7 +403,9 @@ pub fn decode_file(bytes: &[u8]) -> Result<DecodedFile> {
         return Err(corrupt("file too short"));
     }
 
-    let header = Header::parse(&bytes[0..HEADER_SIZE])?;
+    // `Header::parse` length-checks internally; pass the full slice so the bound
+    // is enforced by `parse` rather than relying on the floor check above.
+    let header = Header::parse(bytes)?;
     header.validate()?;
     let page_size = header.page_size as usize;
 
@@ -498,7 +512,7 @@ pub fn decode_file_pages(bytes: &[u8]) -> Result<Vec<(u32, Vec<u8>)>> {
     decode_file(bytes)?;
 
     let len = bytes.len();
-    let header = Header::parse(&bytes[0..HEADER_SIZE])?;
+    let header = Header::parse(bytes)?;
     let page_size = header.page_size as usize;
 
     let size_field_off = len - TRAILER_SIZE - 8;
@@ -532,7 +546,17 @@ pub fn decode_file_pages(bytes: &[u8]) -> Result<Vec<(u32, Vec<u8>)>> {
 /// by the snapshot conformance test (the CRC64 of this image must equal the live
 /// DB's CRC64). Errors if the file is not a snapshot or a page is missing.
 pub fn decode_database_image(bytes: &[u8]) -> Result<Vec<u8>> {
-    let header = Header::parse(&bytes[0..HEADER_SIZE])?;
+    // Verify the whole file FIRST. This mirrors Go's `DecodeDatabaseTo`, which
+    // calls `DecodeHeader` (and thus `Header.Validate`) before it computes
+    // `LockPgno` or touches `Commit` (decoder.go:224-236). Validating up front is
+    // what makes the steps below panic-free on adversarial input: a header with
+    // `page_size == 0` is rejected here, so `lock_pgno` (a `PENDING_BYTE / size`
+    // divide) and the `Header::parse` slice never see a degenerate header.
+    let pages = decode_file_pages(bytes)?;
+
+    // The header is now known-valid (decode_file_pages → decode_file validated
+    // it), so `Header::parse` cannot fail and `lock_pgno` cannot divide by zero.
+    let header = Header::parse(bytes)?;
     if !header.is_snapshot() {
         return Err(corrupt(
             "cannot decode non-snapshot LTX file to SQLite database",
@@ -542,7 +566,6 @@ pub fn decode_database_image(bytes: &[u8]) -> Result<Vec<u8>> {
     let lock = lock_pgno(header.page_size);
 
     // Materialize the pages, keyed by page number.
-    let pages = decode_file_pages(bytes)?;
     let mut by_pgno: std::collections::HashMap<u32, Vec<u8>> = std::collections::HashMap::new();
     for (pgno, data) in pages {
         by_pgno.insert(pgno, data);

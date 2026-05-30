@@ -48,6 +48,47 @@ Non-blocking: crate/repo name `rustyriver`; no debug CLI in the one-shot.
 
 ## Escalations log (agent appends; newest first)
 
+### 2026-05-30 — T16 — Fuzz/robustness for LTX+WAL parsers: TWO real panics found & fixed (G4) + budget DECISION
+**Context:** `tests/fuzz_parsers.rs` (new in-tree fuzz suite), `src/ltx.rs`
+(`decode_database_image`, `lock_pgno`).
+**Two real panic bugs the fuzzer surfaced (both now fixed, both were a divergence
+from upstream Go's ordering, both are exactly the resilience class G4 exists to
+catch):**
+1. **`decode_database_image` sliced `&bytes[0..HEADER_SIZE]` before any length
+   check** (old `ltx.rs:535`). On any sub-100-byte input (empty / 50-byte
+   truncated upload / mutated golden) the fixed-width slice panicked with
+   index-out-of-range *before* the `decode_file_pages` geometry guard ran.
+2. **`lock_pgno(0)` divided by zero** (`PENDING_BYTE / page_size`). A mutation that
+   zeroes the header's page-size field reached `lock_pgno` in
+   `decode_database_image` *before* validation, aborting with "attempt to divide
+   by zero".
+**Root cause (same for both):** Go's `Decoder.DecodeDatabaseTo` (decoder.go:224-236)
+calls `DecodeHeader` — which runs `Header.Validate` (rejecting page_size==0) — and
+only *then* computes `LockPgno`/`Commit`. The Rust port computed `lock_pgno` and
+sliced the header *before* the verifying `decode_file_pages` call.
+**Fix (faithful to Go's order):** reorder `decode_database_image` to verify the
+whole file FIRST (`decode_file_pages` → `decode_file` → `header.validate()`), then
+compute `lock_pgno`/assemble the image on the now-known-valid header. Pass the full
+slice to `Header::parse` (which length-checks internally) instead of a fixed
+`bytes[0..HEADER_SIZE]`. Additionally hardened the public `lock_pgno` to return `0`
+(never a real page) for `page_size==0` rather than dividing — belt-and-suspenders
+for any direct external caller, with NO change to the value for any valid power-of-
+two page size. Marked `// DECISION`-adjacent doc-comments at both sites. The two
+fixes are proven load-bearing: reverting them turns 4 of the 7 fuzz tests RED with
+`PANIC in ltx::decode_database_image`, including the named regression guard
+`ltx_decode_database_image_short_input_returns_err_not_panic`.
+**DECISION — bounded in-tree fuzz, not cargo-fuzz.** cargo-fuzz/libFuzzer needs
+nightly + is outside KEEP scope and the no-new-dependency rule, so per the task's
+explicit allowance this is a bounded fuzz-style suite: a self-contained SplitMix64
+PRNG (zero new deps; `proptest`'s RNG was an option but the internal `TestRng` API
+is awkward and a fixed-seed SplitMix64 is simpler + fully reproducible) drives
+RANDOM_ITERS=20_000 random buffers + MUTATION_ITERS=800×6 mutated golden `.ltx`
+files + 1_600 mutated golden WAL + hand-written adversarial corpora through EVERY
+public LTX decode entrypoint and the WAL reader, each call wrapped in
+`catch_unwind` asserting "no panic". Fixed `SEED` ⇒ byte-for-byte reproducible; a
+failure prints the offending bytes (hex) + seed. Budget tuned so the suite is ~8s.
+**Needs from human:** none — both panics fixed and regression-guarded; G4 met.
+
 ### 2026-05-30 — T13 — Differential gate G3 vs the real `litestream` binary: PASS (both directions, byte-identical) + deferrals
 **Context:** `tests/differential_xtool.rs` (the D1/D2/D3 cross-tool differential
 suite, PLAN.md §6.3). Drives the **real `litestream` binary** (a from-source
