@@ -22,7 +22,7 @@ in parallel; gates between waves are hard stops.
 
 ## Wave 2 — core
 - [x] **T5** `client/mod.rs` — `ReplicaClient` trait + generic conformance suite. Port `replica_client_test.go`. *(dep: T2)* — *Done 2026-05-30 (inline): async `ReplicaClient` trait (type/init/ltx_files/open_ltx_file/write_ltx_file/delete_ltx_files/delete_all) + `ltx::FileInfo` + the generic `run_client_suite` (empty/write/list-order/seek/full+partial reads/size==0-EOF/not-found/delete/delete_all) + `make_test_ltx_file`. `// DECISION:` buffered I/O for KEEP scope (logged in OPEN_QUESTIONS). Suite is exercised by T6 (passes).*
-- [ ] **T8** `store.rs` — snapshot/TXID bookkeeping + retention. Port `store_test.go`. *(dep: T2)* — **NEXT (Wave 2).**
+- [x] **T8** `store.rs` — snapshot/TXID bookkeeping + retention. Port `store_test.go`. *(dep: T2)* — *Done 2026-05-30 (inline): ported the retention **selection** algorithms (`select_retention_by_txid` strict-`<`, `select_snapshot_retention` by time + min-txid tracking, `select_l0_retention_by_time` stop-early/L1-eligibility) + `max_txid`/`keep_newest`, with 9 footgun tests. **Scope:** the upstream `Store`'s multi-DB orchestration, compaction monitors, heartbeats, and validation are OUT (L0-only, no compaction, single replica); L0-by-time retention is a documented no-op until compaction exists (Risk R-3).*
 - [ ] **T9** `db.rs` — checkpoint takeover, LTX capture loop, snapshot-on-continuity-break, clean shutdown. Port `db_test.go`, `db_internal_test.go`, `db_shutdown_test.go`. *(dep: T1, T2)* — **HIGH RISK / largest task** (recon brief `docs/porting-briefs/T9.md`); plan to land in sub-steps.
 
 ## Wave 3 — clients
