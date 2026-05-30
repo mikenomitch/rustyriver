@@ -48,6 +48,61 @@ Non-blocking: crate/repo name `rustyriver`; no debug CLI in the one-shot.
 
 ## Escalations log (agent appends; newest first)
 
+### 2026-05-30 — T10 — Replica sync+restore: compactor reimplementation (DECISION) + L0-only restore-plan + deferrals
+**Context:** `src/replica.rs` (the single-replica sync loop + restore). Ported from `replica.go`
+(+ ltx@v0.5.1 `compactor.go`/`decoder.go`). Drives G2.
+**DECISION — reimplement the LTX compactor as an in-memory page-merge (not a streaming
+`io.Pipe`+`Compactor`+`DecodeDatabaseTo`):** Go's `Replica.Restore` (replica.go:667-682) wires
+`ltx.NewCompactor(pw, rdrs)` into a goroutine writing an `io.Pipe`, then `Decoder.DecodeDatabaseTo`
+reads the compacted snapshot off the other end into the DB file. The buffered-I/O DECISION already
+taken for the client (T5) makes a streaming pipe pointless here, so `build_database_image` does the
+compactor's job directly: decode+**verify** every input (`ltx::decode_file`, so a corrupt download
+is caught), then for pages `1..=commit` (commit = the LAST input's `Commit`, the truncation bound,
+compactor.go:108-118,217) take the **latest** input carrying each page (forward-iterate, last write
+wins == compactor's newest-first selection compactor.go:203-224), with the lock page zero-filled
+(decoder.go:236-254). Proven equivalent to the real tool three ways: (a) a single-snapshot merge is
+byte-identical to `ltx::decode_database_image`; (b) the G2 round-trip reproduces the source under
+Oracle A; (c) **our restore of the committed golden replica is Oracle-A-identical to the real
+`litestream restore` of the same tree** (`restore_golden_replica_matches_real_litestream`).
+**Finding (not an ambiguity) — L0-only stores snapshots at level 0, not `SnapshotLevel(9)`:** the
+real binary's L0-only tree (golden fixture, captured from `replicate -once`) holds the snapshot
+(MinTXID==1) and every incremental under `ltx/0/`; level 9 is empty without compaction.
+`calc_restore_plan` is still a faithful port of `CalcRestorePlan` (snapshot anchor probed at
+`SnapshotLevel` + per-level `restoreLevelCursor`s + `restoreCandidateBetter`), so it works unchanged
+once compaction lands; in this scope the plan is the contiguous L0 chain. Verified the
+continuity-break shape (a re-emitted wider snapshot 1-N among per-txn files) selects the wider
+snapshot (`calc_restore_plan_prefers_wider_reemitted_snapshot`).
+**Discovery — `Replica` owns an OPTIONAL `Db`:** Go's `NewReplicaWithClient(nil, client)` (used by the
+restore-only tests) means the db pointer is nilable; mirrored as `db: Option<Db>`. `restore()` is a
+free function over a bare `&C: ReplicaClient` (no DB needed), matching `Replica.Restore`'s
+client-only data flow. Added `Error::TxNotAvailable` (store.go:27) for the empty-replica /
+unreachable-TXID cases, and made `Db::ltx_path` `pub` (Go's exported `DB.LTXPath`, read by
+`uploadLTXFile`).
+**Deferrals (logged, NOT on the G2 path; land with the background runtime / later waves):**
+1. **Follow mode** (`Replica.follow`/`applyNewLTXFiles`/`applyLTXFile`/`fillFollowGap`,
+   replica.go:730-987 + the `TestReplica_ApplyNewLTXFiles_*`/`ApplyLTXFile_VerifiesChecksumOnClose`
+   internal tests): the continuous tail-restore loop + its gap-bridging across compaction levels.
+   The one-shot G2 gate is a single restore; follow needs the higher compaction levels (out of L0
+   scope) to be meaningful and a long-running poll loop. The page-apply primitive it shares
+   (`build_database_image`'s merge) is implemented + tested.
+2. **Background monitor goroutine + exponential backoff** (`Replica.monitor`/`Start`/`Stop`,
+   replica.go:92-128,326-441, footgun F-13) + `AutoRecoverEnabled` reset path: needs a Tokio task
+   owning the `Db`; the synchronous `sync()` primitive it would call on a ticker is implemented and
+   tested here. The `auto_recover_enabled` field is kept on `Replica` so the surface matches upstream.
+3. **V3 (v0.3.x generation) restore** (`RestoreV3` and the whole `ReplicaClientV3` shim,
+   replica.go:990-1418): **DROPPED** (PLAN.md §2 — greenfield, nothing to be backward-compatible
+   with). Recorded in the T17 coverage report.
+4. **Timestamp / point-in-time restore through the public API + `RestoreOptions`/integrity-check
+   modes** (`CalcRestoreTarget`/`checkIntegrity`, replica.go:443-520,1238-1272): `calc_restore_plan`
+   already honors a target **TXID** (tested), and the integration test runs the equivalent of a
+   post-restore integrity check via Oracle A's `PRAGMA integrity_check`. The timestamp path +
+   structured options surface stay minimal for the one-shot; revisit at T11 (integration) /
+   public-API stabilization (T17).
+5. **`EnforceRetention`** (replica.go:252-284) is `panic!("TODO")` upstream pending multi-level
+   compaction; the L0/snapshot retention **selection** already lives in `store.rs` (T8). Not ported
+   (out of scope), not on any tested path.
+**Needs from human:** none — conservative, tested, golden-anchored choices throughout.
+
 ### 2026-05-30 — T9 — Async/blocking shape (DECISION: synchronous `Db`) + two-connection read-lock + deferrals
 **Context:** `src/db.rs` (the WAL→LTX capture loop + checkpoint takeover). Ported from `db.go`.
 **DECISION — synchronous `Db` (footgun F-1 / brief §2 shape choice):** The brief offered

@@ -308,7 +308,11 @@ impl Db {
     }
 
     /// Local path of a single LTX file. Ported from `DB.LTXPath` (db.go:338).
-    fn ltx_path(&self, level: u32, min_txid: TXID, max_txid: TXID) -> String {
+    ///
+    /// `pub` so the [`crate::replica::Replica`] can read the local L0 LTX files
+    /// the capture loop wrote and upload them (the Go exported `DB.LTXPath`,
+    /// used by `Replica.uploadLTXFile`, replica.go:183).
+    pub fn ltx_path(&self, level: u32, min_txid: TXID, max_txid: TXID) -> String {
         ltx_file_path(&self.meta_path.to_string_lossy(), level, min_txid, max_txid)
     }
 

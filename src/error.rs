@@ -42,6 +42,13 @@ pub enum Error {
     #[error("ltx file missing")]
     LTXMissing,
 
+    /// The requested transaction does not exist on the replica (no backup chain
+    /// reaches it).
+    ///
+    /// Corresponds to `ErrTxNotAvailable` in store.go:27.
+    #[error("transaction not available")]
+    TxNotAvailable,
+
     /// Structured LTX error with operation context and recovery hints.
     ///
     /// Corresponds to `LTXError` in litestream.go:40-93.
