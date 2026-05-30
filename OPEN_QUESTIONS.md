@@ -95,6 +95,42 @@ T7 precedent (this log, 2026-05-30 T7). The lock object is rustyriver-internal
 also parseable by Go's `time.RFC3339Nano`, so cross-version compat holds.
 Round-trip + Go-style-timestamp-parse + exact-JSON-shape are unit-tested.
 
+**CORRECTION (2026-05-30, T15 fixer) — the original "rustyriver-internal /
+cross-version compat holds" claim was wrong for the Go→rustyriver direction.** The
+lock object is NOT internal: a real-Litestream node and a rustyriver node can
+share/migrate/fail-over the same `lock.json`. Go's `s3.Leaser` stamps
+`Lease.ExpiresAt = time.Now().Add(TTL)` (s3/leaser.go:110,148) with **no** `.UTC()`,
+and the default `time.Time` JSON marshaller serialises in the host's LOCAL timezone.
+So on any non-UTC host (developer laptops; any server not set to UTC) `expires_at`
+carries a numeric offset, e.g. `"2999-05-30T12:34:56.789-04:00"` / `"…+05:30"` —
+NOT a `Z`. The original `rfc3339::parse` did `s.strip_suffix('Z')?` and returned
+`None` for every offset form, so `read_lease` → `serde_json` failed and
+`acquire_lease`/`release_lease` returned a "decode lock file" error instead of the
+Go-faithful `LeaseExistsError` — i.e. a rustyriver node could not detect the live
+holder or take over an expired lock written by real Litestream on a non-UTC host.
+The fencing primitive's core job. Reviewer added a failing test
+(`acquire_reads_go_lock_written_in_non_utc_timezone`); the original check only
+verified rustyriver→Go, never Go→rustyriver.
+
+**Fix:** `rfc3339::parse` now accepts BOTH `…Z` and the numeric-offset form
+`…±HH:MM`, normalising the offset away to a UTC `SystemTime` (offset subtracted
+from the local civil seconds). The accepted/rejected grammar is exactly what Go's
+`time.Parse(time.RFC3339Nano, …)` does (empirically diffed against the Go 1.25
+toolchain across UTC/New_York/Kolkata/Kathmandu/Chatham/St_Johns): the zone is the
+literal `Z` or `±HH:MM` with the colon and 2+2 digits **mandatory** — lowercase
+`z`/`t`, basic-format `±HHMM`, and offsets with seconds `±HH:MM:SS` are rejected by
+Go and therefore by us. `format` is unchanged and still **emits** `…Z` (rustyriver
+never has to match Go's exact bytes — Go re-parses our `Z` form fine; the asymmetry
+is intentional). No new dependency (still hand-rolled Hinnant civil math). New unit
+tests: `parse_accepts_go_numeric_offsets_as_same_instant` (six zones → one UTC
+instant) and `parse_rejects_zone_forms_go_rejects`.
+
+**Known cosmetic-only residue (no behavioural impact, no test):** `LeaseExistsError`
+Display renders `expires_at` via `rfc3339::format` (nanosecond precision) whereas Go
+uses `time.RFC3339` (second precision, leaser.go:19), so a sub-second expiry yields a
+slightly different human-readable error string. The compared value (the UTC instant)
+is identical; only the operator-facing message text differs. Left as-is.
+
 **Dependency (AGENTS.md rule 7) — `reqwest` for the `HeartbeatClient` GET, gated on
 `s3`.** `heartbeat.go`'s `Ping` does an HTTP GET. `reqwest` is **already** a
 transitive dependency of `object_store/aws` (feature `s3`) with features

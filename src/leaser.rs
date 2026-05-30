@@ -743,14 +743,27 @@ impl HeartbeatClient {
 //
 // Go marshals `Lease.ExpiresAt` (a `time.Time`) with the default `time.Time`
 // JSON encoder, i.e. RFC-3339 with nanosecond precision (`time.RFC3339Nano`,
-// e.g. "2026-05-30T12:34:56.789012345Z"). The lock object is rustyriver-internal
-// (read back only by this same code, brief §3), so the requirement is faithful
-// round-tripping at nanosecond resolution — which `SystemTime::now()` carries and
-// the millisecond-only helper in `client/object_store.rs` would truncate. We keep
-// this module self-contained (no `chrono`/`time` dependency, matching the T7
-// precedent logged in OPEN_QUESTIONS.md) and emit/parse a `…Z` UTC RFC-3339 with
-// up-to-9-digit trailing-zero-trimmed fractional seconds, which Go's
-// `time.RFC3339Nano` parser accepts verbatim.
+// e.g. "2026-05-30T12:34:56.789012345Z"). Critically, the lock object is NOT
+// rustyriver-internal: real Litestream and rustyriver can share/migrate/fail-over
+// the same `lock.json`, so this code must read whatever the Go binary wrote.
+//
+// emit vs. parse are asymmetric on purpose:
+//   * `format` always emits a `…Z` UTC string. (rustyriver never has to match Go's
+//     bytes here — Go re-parses by value, not by string, and the only Go consumer
+//     of our serialisation is its own `time.RFC3339Nano` parser, which accepts our
+//     `Z` form verbatim.)
+//   * `parse` must accept BOTH `…Z` and the numeric-offset form `…±HH:MM`, because
+//     Go's `s3.Leaser` stamps `time.Now().Add(TTL)` with no `.UTC()`, so on any
+//     non-UTC host the marshaller writes the expiry in local time with a numeric
+//     offset (s3/leaser.go:110,148; confirmed byte-for-byte with Go 1.25). Both
+//     forms denote the same UTC instant, which is all `is_expired`/`ttl` compare,
+//     so `parse` normalises the offset away. (Contrast the T7 metadata path, where
+//     Go calls `.UTC()` explicitly and only `Z` can occur.)
+//
+// We keep this module self-contained (no `chrono`/`time` dependency, matching the
+// T7 precedent logged in OPEN_QUESTIONS.md), preserving nanosecond resolution —
+// which `SystemTime::now()` carries and the millisecond-only helper in
+// `client/object_store.rs` would truncate.
 mod rfc3339 {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -790,11 +803,24 @@ mod rfc3339 {
         }
     }
 
-    /// Parses a `…Z` RFC-3339 UTC string with optional fractional seconds back
-    /// into a `SystemTime`. Returns `None` on any shape we don't recognise.
+    /// Parses an RFC-3339 timestamp (the trailing zone designator may be `Z` for
+    /// UTC, or a numeric offset `±HH:MM`) with optional fractional seconds, back
+    /// into a `SystemTime` normalised to UTC. Returns `None` on any shape we don't
+    /// recognise.
+    ///
+    /// We must accept the numeric-offset form because Go's `s3.Leaser` writes
+    /// `Lease.ExpiresAt = time.Now().Add(TTL)` (s3/leaser.go:110,148) **without**
+    /// `.UTC()`, and Go's default `time.Time` JSON marshaller (`time.RFC3339Nano`)
+    /// serialises in the host's LOCAL timezone — so a lock file written by real
+    /// Litestream on any non-UTC host carries an offset like `-04:00`/`+05:30`,
+    /// not a `Z` (empirically confirmed with Go 1.25 across several zones). The
+    /// grammar here is exactly what Go's `time.Parse(time.RFC3339Nano, …)` accepts
+    /// (and the marshaller emits): the zone is the literal `Z` or a `±HH:MM` with
+    /// the colon and 2+2 digits mandatory — basic-format `±HHMM`, offsets carrying
+    /// seconds (`±HH:MM:SS`), and lowercase `t`/`z` are all rejected by Go and
+    /// therefore by us. See OPEN_QUESTIONS.md (T15 Go→rustyriver direction).
     pub fn parse(s: &str) -> Option<SystemTime> {
-        let body = s.strip_suffix('Z')?;
-        let (date, time) = body.split_once('T')?;
+        let (date, time_and_zone) = s.split_once('T')?;
 
         let mut dparts = date.split('-');
         let year: i64 = dparts.next()?.parse().ok()?;
@@ -803,6 +829,12 @@ mod rfc3339 {
         if dparts.next().is_some() {
             return None;
         }
+
+        // Split the trailing zone designator off the time field first, so the
+        // numeric-offset sign is never mistaken for part of the fractional
+        // seconds. `offset_secs` is the local-minus-UTC offset in seconds (0 for
+        // `Z`); the UTC instant is `local_civil_secs - offset_secs`.
+        let (time, offset_secs) = split_zone(time_and_zone)?;
 
         let (hms, frac) = match time.split_once('.') {
             Some((hms, frac)) => (hms, Some(frac)),
@@ -816,7 +848,10 @@ mod rfc3339 {
             return None;
         }
 
-        let secs = unix_secs_from_civil(year, month, day, hour, min, sec)?;
+        let civil_secs = unix_secs_from_civil(year, month, day, hour, min, sec)?;
+        // Normalise to UTC by removing the zone offset, then require a >= epoch
+        // result (lease expiries are always future wall-clock values).
+        let secs = civil_secs.checked_sub(offset_secs)?;
         if secs < 0 {
             return None;
         }
@@ -834,6 +869,43 @@ mod rfc3339 {
             }
         };
         Some(UNIX_EPOCH + Duration::new(secs as u64, nanos))
+    }
+
+    /// Strips the RFC-3339 zone designator from the end of the time field,
+    /// returning `(time_without_zone, offset_seconds)` where `offset_seconds` is
+    /// the local-minus-UTC offset (`0` for the `Z`/UTC form). Returns `None` for
+    /// any zone shape Go's `time.RFC3339Nano` rejects (no zone, lowercase `z`,
+    /// basic-format `±HHMM`, an offset with seconds, or out-of-range fields).
+    fn split_zone(time_and_zone: &str) -> Option<(&str, i64)> {
+        // UTC: a trailing uppercase `Z` (Go does not accept lowercase here).
+        if let Some(time) = time_and_zone.strip_suffix('Z') {
+            return Some((time, 0));
+        }
+
+        // Numeric offset `±HH:MM`. The sign is the last '+'/'-' in the string; in
+        // the time field proper ("HH:MM:SS[.frac]") neither character can appear,
+        // so the first such byte unambiguously begins the offset.
+        let sign_idx = time_and_zone.bytes().position(|b| b == b'+' || b == b'-')?;
+        let (time, zone) = time_and_zone.split_at(sign_idx);
+        let sign = if zone.as_bytes()[0] == b'+' { 1 } else { -1 };
+
+        // After the sign, exactly `HH:MM` (2 digits, ':', 2 digits) — matching
+        // Go's `Z07:00` layout. Reject `±HHMM` (no colon) and `±HH:MM:SS`.
+        let body = &zone[1..];
+        let (hh, mm) = body.split_once(':')?;
+        if hh.len() != 2
+            || mm.len() != 2
+            || !hh.bytes().all(|b| b.is_ascii_digit())
+            || !mm.bytes().all(|b| b.is_ascii_digit())
+        {
+            return None;
+        }
+        let off_h: i64 = hh.parse().ok()?;
+        let off_m: i64 = mm.parse().ok()?;
+        if off_h > 23 || off_m > 59 {
+            return None;
+        }
+        Some((time, sign * (off_h * 3600 + off_m * 60)))
     }
 
     /// Unix seconds (>= 0) → civil `(year, month, day, hour, min, sec)` in UTC.
@@ -960,6 +1032,62 @@ mod tests {
         let expected = SystemTime::UNIX_EPOCH + Duration::new(1_700_000_000, 500_000_000);
         assert_eq!(lease.expires_at, expected);
         assert_eq!(lease.generation, 3);
+    }
+
+    /// `rfc3339::parse` must accept the numeric-offset forms Go's local-timezone
+    /// marshaller emits on non-UTC hosts and resolve each to the SAME UTC instant
+    /// as the equivalent `Z` form. Every string below is the verbatim
+    /// `json.Marshal` output for one fixed instant rendered in a different zone,
+    /// captured from the Go 1.25 toolchain (`UTC`, `America/New_York`,
+    /// `Asia/Kolkata`, `Asia/Kathmandu`, `Pacific/Chatham` — note the offset rolls
+    /// the civil date to May 31 — and `America/St_Johns`). Go's
+    /// `time.Parse(time.RFC3339Nano, …)` maps all six to unix=32485077296.789.
+    #[test]
+    fn parse_accepts_go_numeric_offsets_as_same_instant() {
+        // 2999-05-30T16:34:56.789Z, the shared UTC instant.
+        let expected = SystemTime::UNIX_EPOCH + Duration::new(32_485_077_296, 789_000_000);
+        let go_emitted = [
+            "2999-05-30T16:34:56.789Z",      // UTC
+            "2999-05-30T12:34:56.789-04:00", // America/New_York
+            "2999-05-30T22:04:56.789+05:30", // Asia/Kolkata
+            "2999-05-30T22:19:56.789+05:45", // Asia/Kathmandu
+            "2999-05-31T05:19:56.789+12:45", // Pacific/Chatham (date rolled +1)
+            "2999-05-30T14:04:56.789-02:30", // America/St_Johns
+        ];
+        for s in go_emitted {
+            assert_eq!(
+                rfc3339::parse(s),
+                Some(expected),
+                "offset form {s:?} must resolve to the canonical UTC instant"
+            );
+        }
+
+        // A whole-second offset value (no fractional part) Go also emits.
+        assert_eq!(
+            rfc3339::parse("2999-05-30T12:34:56-04:00"),
+            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(32_485_077_296)),
+        );
+    }
+
+    /// The parser must reject exactly the zone shapes Go's `time.RFC3339Nano`
+    /// rejects, so we never silently accept input the real binary would refuse:
+    /// missing zone, lowercase `z`/`t`, basic-format `±HHMM` (no colon), and an
+    /// offset carrying seconds `±HH:MM:SS`. (All confirmed to fail `time.Parse`
+    /// under Go 1.25.)
+    #[test]
+    fn parse_rejects_zone_forms_go_rejects() {
+        let rejected = [
+            "2999-05-30T12:34:56.789",          // no zone designator
+            "2999-05-30t16:34:56.789z",         // lowercase t and z
+            "2999-05-30T16:34:56.789z",         // lowercase z only
+            "2999-05-30T12:34:56.789-0400",     // basic-format offset (no colon)
+            "2999-05-30T12:34:56.789-04:00:00", // offset with seconds
+            "2999-05-30T12:34:56.789-4:00",     // single-digit offset hour
+            "2999-05-30T12:34:56.789+24:00",    // out-of-range offset hour
+        ];
+        for s in rejected {
+            assert_eq!(rfc3339::parse(s), None, "{s:?} must be rejected like Go");
+        }
     }
 
     #[test]
@@ -1169,6 +1297,55 @@ mod tests {
             le.expires_at > SystemTime::now(),
             "non-zero future ExpiresAt"
         );
+    }
+
+    /// REVIEWER (T15 divergence): a lock file written by the real Litestream Go
+    /// binary on a node whose LOCAL timezone is not UTC must be readable.
+    ///
+    /// Go sets `Lease.ExpiresAt = time.Now().Add(TTL)` (s3/leaser.go:110,148) with
+    /// **no** `.UTC()` normalisation, and the default `time.Time` JSON marshaller
+    /// (`appendStrictRFC3339`, used by `MarshalJSON`) emits the value in the local
+    /// timezone — i.e. with a numeric offset such as `-04:00` / `+05:30`, NOT a
+    /// `Z` suffix — whenever the host offset is non-zero. The bytes below are the
+    /// verbatim output of `json.Marshal` on a `litestream.Lease` in
+    /// `America/New_York` (empirically reproduced with the Go toolchain).
+    ///
+    /// rustyriver's `rfc3339::parse` only accepts a `Z` suffix
+    /// (`s.strip_suffix('Z')?`), so `read_lease` fails to decode this object and
+    /// `acquire_lease` returns a "decode lock file" error instead of the
+    /// Go-faithful `LeaseExistsError`. A rustyriver node therefore cannot fence
+    /// against — or take over from — a real Litestream deployment (or a rustyriver
+    /// instance reading a lock seeded by one) running on any non-UTC host.
+    ///
+    /// Expected (Go-faithful) behaviour: acquisition is blocked by the live lease
+    /// and a `LeaseExistsError` carrying the holder's owner is returned.
+    #[tokio::test]
+    async fn acquire_reads_go_lock_written_in_non_utc_timezone() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let key = object_store::path::Path::from("lock.json");
+
+        // Byte-for-byte `json.Marshal(litestream.Lease{...})` output from a Go
+        // node in America/New_York. The year is far in the future so the lease is
+        // unambiguously active regardless of the parsed offset.
+        let go_lock_json =
+            br#"{"generation":4,"expires_at":"2999-05-30T12:34:56.789-04:00","owner":"go-host:42"}"#;
+        store.put(&key, go_lock_json.to_vec().into()).await.unwrap();
+
+        let leaser = S3Leaser::new(store.clone()).with_owner("rusty");
+        let err = leaser
+            .acquire_lease()
+            .await
+            .expect_err("a live remote lease must block acquisition");
+
+        // Go would surface the holder via LeaseExistsError; rustyriver must too.
+        let le = err.as_lease_exists().unwrap_or_else(|| {
+            panic!(
+                "expected LeaseExistsError for the live Go-written lock, got {err:?} \
+                 (the non-UTC offset timestamp failed to parse)"
+            )
+        });
+        assert_eq!(le.owner, "go-host:42");
+        assert!(le.expires_at > SystemTime::now(), "future ExpiresAt");
     }
 
     // ── Renew (ports of the RenewLease tests) ──────────────────────────────────
