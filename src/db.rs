@@ -265,6 +265,15 @@ impl Db {
 
     // ── Paths ──────────────────────────────────────────────────────────────
 
+    /// Computes the litestream meta-directory path (`.<file>-litestream`) for a
+    /// database file path, without opening it. Public so a host can locate (e.g.
+    /// to wipe, during a hard recovery) the meta dir of a database it no longer
+    /// has an open [`Db`] handle for. Mirrors `DB.MetaPath` (db.go:292) at the
+    /// path level.
+    pub fn meta_path_for_path(path: impl AsRef<Path>) -> PathBuf {
+        Self::meta_path_for(path.as_ref())
+    }
+
     fn meta_path_for(path: &Path) -> PathBuf {
         // Go: filepath.Join(dir, "."+file+MetaDirSuffix) (db.go:206).
         let dir = path.parent();
@@ -493,6 +502,39 @@ impl Db {
             Err(e) => return Err(e.into()),
         }
         self.max_l0_file_info = None;
+        self.invalidate_pos_cache();
+        Ok(())
+    }
+
+    /// Clears the local L0 directory and seeds it with a single baseline L0 LTX
+    /// file (`data` for the `min_txid`..`max_txid` range), atomically. The next
+    /// [`Db::sync`] then sees the baseline does not match the real WAL and writes
+    /// a fresh snapshot at the current database state.
+    ///
+    /// This is the file-writing tail of `checkDatabaseBehindReplica`
+    /// (db.go:1241-1293): clear L0, invalidate the pos cache, write the fetched
+    /// remote L0 file to its local path via a temp-file + fsync + rename, then
+    /// invalidate the cache again. The *detection* half (compare DB pos vs replica
+    /// pos and fetch the bytes) lives on [`crate::replica::Replica`] because the
+    /// synchronous `Db` has no `ReplicaClient` handle of its own (see the module
+    /// docs / OPEN_QUESTIONS T9/T10 deferral). Used by
+    /// [`crate::replica::Replica::check_database_behind_replica`] (issue #781).
+    pub fn seed_l0_baseline(&mut self, min_txid: TXID, max_txid: TXID, data: &[u8]) -> Result<()> {
+        // Clear local L0 files (db.go:1241-1249).
+        let l0_dir = self.ltx_level_dir(0);
+        match std::fs::remove_dir_all(&l0_dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        self.max_l0_file_info = None;
+        self.invalidate_pos_cache();
+        std::fs::create_dir_all(&l0_dir)?;
+
+        // Write the baseline file atomically (db.go:1260-1286).
+        let local_path = self.ltx_path(0, min_txid, max_txid);
+        let tmp_path = format!("{local_path}.tmp");
+        write_file_atomic(&tmp_path, &local_path, data)?;
         self.invalidate_pos_cache();
         Ok(())
     }

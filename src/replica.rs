@@ -109,6 +109,14 @@ impl<C: ReplicaClient> Replica<C> {
         self.db.as_ref()
     }
 
+    /// Consumes the replica and returns the attached database, if any. Lets a
+    /// host perform a clean [`Db::close`] (which consumes the `Db`) after a final
+    /// sync — the shutdown ordering the deferred monitor loop would otherwise own
+    /// (replica.go `Stop` → `db.Close`).
+    pub fn into_db(self) -> Option<Db> {
+        self.db
+    }
+
     /// Returns a mutable reference to the attached database, if any. Lets a
     /// caller drive `db.sync()` (the local capture half) before `replica.sync()`
     /// (the upload half) — the `SyncAndWait` ordering (db.go:500-512).
@@ -253,6 +261,67 @@ impl<C: ReplicaClient> Replica<C> {
     /// (replica.go:533).
     pub async fn restore(&self, output_path: impl AsRef<Path>) -> Result<()> {
         restore(&self.client, output_path, TXID(0)).await
+    }
+
+    /// Detects when the local database has been restored to an earlier state
+    /// than the replica (a lower TXID) and, if so, seeds the local L0 directory
+    /// with the replica's newest L0 file so the next sync snapshots forward.
+    ///
+    /// Ported from `DB.checkDatabaseBehindReplica` (db.go:1211-1294), issue #781.
+    /// In upstream this runs inside `DB.init()` because the `DB` owns its
+    /// `Replica`; our synchronous `Db` does not, so the orchestration lives here
+    /// on `Replica` and a host calls it once after [`Db::open`], before the first
+    /// sync. The file-writing tail is [`Db::seed_l0_baseline`].
+    ///
+    /// Without this, a hard recovery (restore an old snapshot, reopen, write new
+    /// data) would silently drop the new writes: the fresh local DB snapshots at
+    /// TXID 1, but [`Replica::sync`] computes the replica position from the
+    /// remote's higher `MaxTXID`, so its upload loop (`pos+1 ..= db.pos`) never
+    /// runs (`pos+1` already exceeds the local DB's TXID). Seeding the remote
+    /// baseline makes the next [`Db::sync`] see a continuity break and snapshot at
+    /// the current (post-restore-plus-writes) state, which then uploads.
+    ///
+    /// No-op (returns `Ok`) when there is no remote data, when the database is at
+    /// or ahead of the replica, or when there is no attached database.
+    pub async fn check_database_behind_replica(&mut self) -> Result<()> {
+        // Replica position from remote (db.go:1224-1230). Done first so a
+        // restore-only replica with no DB is a clean no-op.
+        let replica_info = self.max_ltx_file_info(0).await?;
+        if replica_info.max_txid == TXID(0) {
+            return Ok(()); // no remote replica data yet
+        }
+
+        let db = match self.db.as_mut() {
+            Some(db) => db,
+            None => return Ok(()),
+        };
+
+        // Database position from local L0 files (db.go:1218-1222).
+        let db_pos = db
+            .pos()
+            .map_err(|e| Error::Other(format!("get database position: {e}").into()))?;
+
+        // If the database is ahead or equal, nothing to do (db.go:1232-1235).
+        if db_pos.txid >= replica_info.max_txid {
+            return Ok(());
+        }
+
+        // Fetch the latest L0 LTX file from the replica (db.go:1251-1257).
+        let min_txid = replica_info.min_txid;
+        let max_txid = replica_info.max_txid;
+        let data = self
+            .client
+            .open_ltx_file(0, min_txid, max_txid, 0, 0)
+            .await
+            .map_err(|e| Error::Other(format!("open remote L0 file: {e}").into()))?;
+
+        // Seed it as the local baseline (db.go:1259-1293).
+        db.seed_l0_baseline(min_txid, max_txid, &data)?;
+
+        // Drop the now-stale cached replica position so the next sync recomputes
+        // it from the remote (mirrors clearing pos on a state change).
+        self.pos = Pos::ZERO;
+        Ok(())
     }
 }
 
@@ -762,6 +831,67 @@ mod tests {
             Error::Ltx(e) => assert_eq!(e.op, "open", "op must be open"),
             other => panic!("expected LTXError, got {other:?}"),
         }
+    }
+
+    // check_database_behind_replica is a NO-OP when the replica is empty: it must
+    // never disturb local state just because there is nothing remote (issue #781
+    // guard, db.go:1228-1230). A restore-only replica (no DB) is also a clean
+    // no-op (the `db is None` branch).
+    #[tokio::test]
+    async fn check_behind_replica_noop_when_remote_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path().join("test.db")).unwrap();
+        let client =
+            FileReplicaClient::new(dir.path().join("replica").to_string_lossy().into_owned());
+        let mut r = Replica::new(db, client);
+        // Empty remote → Ok, no panic, no state change.
+        r.check_database_behind_replica()
+            .await
+            .expect("empty remote is a clean no-op");
+
+        // Same for a client-only replica with no DB.
+        let client2 =
+            FileReplicaClient::new(dir.path().join("replica2").to_string_lossy().into_owned());
+        let mut r2 = Replica::new_client_only(client2);
+        r2.check_database_behind_replica()
+            .await
+            .expect("no-DB replica is a clean no-op");
+    }
+
+    // When the database is already at or ahead of the replica, the check is a
+    // no-op and must NOT delete the local L0 chain (db.go:1232-1235). We build a
+    // tiny local+remote pair at the same TXID and assert the local snapshot
+    // survives the call.
+    #[tokio::test]
+    async fn check_behind_replica_noop_when_db_ahead_preserves_local() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path().join("test.db")).unwrap();
+        let client =
+            FileReplicaClient::new(dir.path().join("replica").to_string_lossy().into_owned());
+        let mut r = Replica::new(db, client);
+
+        // Seed BOTH local and remote with a snapshot at TXID 1 (DB == replica).
+        let page_size = 512u32;
+        let snap = build_snapshot_ltx(TXID(1), page_size, 2);
+        // Local L0 file (so db.pos() == 1).
+        let local_path = r.db().unwrap().ltx_path(0, TXID(1), TXID(1));
+        std::fs::create_dir_all(Path::new(&local_path).parent().unwrap()).unwrap();
+        std::fs::write(&local_path, &snap).unwrap();
+        // Remote L0 file at the same TXID.
+        r.client
+            .write_ltx_file(0, TXID(1), TXID(1), &snap)
+            .await
+            .unwrap();
+
+        let before = std::fs::read(&local_path).unwrap();
+        r.check_database_behind_replica()
+            .await
+            .expect("db == replica is a no-op");
+        let after = std::fs::read(&local_path).expect("local L0 file must survive");
+        assert_eq!(
+            before, after,
+            "local L0 chain untouched when DB is not behind"
+        );
     }
 
     // build_database_image merges a snapshot + incrementals like the compactor:

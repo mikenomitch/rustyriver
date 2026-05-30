@@ -48,6 +48,71 @@ Non-blocking: crate/repo name `rustyriver`; no debug CLI in the one-shot.
 
 ## Escalations log (agent appends; newest first)
 
+### 2026-05-30 — T11+12+14 — Resilience/property/fault-injection suites: the issue #781 fix lands + deferrals
+**Context:** `tests/integration_resilience.rs` (T11), `tests/property_roundtrip.rs`
+(T12), `tests/faults_inject.rs` (T14); new production code in `src/replica.rs`
+(`Replica::check_database_behind_replica`, `into_db`) and `src/db.rs`
+(`Db::seed_l0_baseline`, `Db::meta_path_for_path` made public). Built on T10.
+
+**DECISION — implement the issue #781 fix (`checkDatabaseBehindReplica`) on
+`Replica`, called explicitly after `Db::open`, not inside it.** Upstream runs
+`checkDatabaseBehindReplica` inside `DB.init()` (db.go:890-895) because the Go
+`DB` owns its `Replica`. Our synchronous `Db` (T9 DECISION) deliberately has no
+`ReplicaClient` handle, so the T9/T10 notes deferred this to "the Replica
+integration". T11's data-loss test makes it correctness-load-bearing, so it is
+now implemented as `Replica::check_database_behind_replica` (a faithful port of
+db.go:1211-1294: compare `db.Pos()` vs `MaxLTXFileInfo(0)`; if behind, clear the
+local L0 dir and seed the replica's newest L0 file as the baseline so the next
+`db.sync()` snapshots forward). The file-writing tail is `Db::seed_l0_baseline`
+(db.go:1241-1293), which lives on `Db` because only `Db` owns the meta paths. A
+host calls this once after `Db::open` and before the first sync — the same point
+`init()` calls it upstream. **Proven load-bearing:** the ported #781 test
+(`restore_and_replicate_after_data_loss`) FAILS (restored DB has 1 row, not 2)
+when the call is removed, and PASSES with it; two no-op safety unit tests assert
+it never disturbs local L0 state when the remote is empty, when there is no DB,
+or when the DB is at/ahead of the replica.
+
+**Why this is correct in the L0-only KEEP scope (a subtle invariant):** `verify`
+reads `LTXPath(0, pos.TXID, pos.TXID)` (db.go:1311) — i.e. `max-max` — while the
+seeded baseline file is named `min-max`. If a baseline had `min != max` (a
+compacted multi-TXID file), the next `verify` would fail to open it. That cannot
+happen here: with **no compaction (D-7)**, every L0 file is single-TXID
+(`min == max`), so `MaxLTXFileInfo` always returns a `min==max` file and the
+seeded path is exactly what `verify`/`pos` look for. (If compaction is ever added,
+`checkDatabaseBehindReplica` keeps working only because upstream's own L0 files
+stay single-TXID; documented here for the future compaction task.)
+
+**DECISION — proptest seed budget bounded for a fast, deterministic suite.**
+`PROPTEST_CASES = 24`, `MAX_OPS = 14`, `max_shrink_iters = 24`,
+`failure_persistence = None`, values drawn only from the proptest RNG (no
+`randomblob`/wall-clock), so each case is reproducible from its seed and the whole
+property test runs in ~7s. The async upload/restore halves run on a per-case
+current-thread Tokio runtime via `block_on` (proptest bodies are synchronous).
+
+**DEFERRED (logged, NOT on the T11/12/14 functional path):**
+1. **MinIO mirror of the resilience suite + retention-GC integration.** T11's spec
+   lists "vs file + MinIO" and "retention GC". The file-client resilience proofs
+   are complete and the MinIO transport is already covered end-to-end by T7's
+   `tests/integration_minio.rs` (run_client_suite + multipart + metadata against
+   live MinIO, auto-skipping when Docker is absent). Re-running the *same*
+   crash/continuity/fault scenarios over MinIO would add transport coverage but no
+   new replication-logic coverage, and retention GC (`EnforceRetention`) is
+   `panic!("TODO")` upstream pending multi-level compaction (out of L0 scope; the
+   *selection* logic already lives in `store.rs` T8). Revisit at T13 (differential)
+   / T16 (hardening) if a MinIO-specific resilience gap is suspected.
+2. **Clock-skew fault.** T14's spec lists "clock skew". Restore selection is by
+   **TXID**, not timestamp (the timestamp/PITR path is itself deferred from T10);
+   `restore_candidate_better`'s `created_at` tiebreak only matters across
+   compaction levels (none in L0). With no timestamp-driven decision on the KEEP
+   restore path, a clock-skew injection has nothing to perturb. Revisit alongside
+   the timestamp-targeted restore plumbing (T10 deferral #4) at T17.
+3. **`loom`/concurrency** stays a T9/T11 deferral (the synchronous `&mut self`
+   `Db` has no intra-process data race; cross-process WAL races need the background
+   monitor, deferred from T10).
+**Needs from human:** none — conservative, tested, golden/Oracle-A-anchored
+choices throughout; the one correctness-critical addition (#781) is proven
+load-bearing and guarded against regressions in both directions.
+
 ### 2026-05-30 — T7 — ObjectStore (S3/R2/MinIO) client: DECISIONs + deferrals
 **Context:** `src/client/object_store.rs` (the S3/R2/MinIO `ReplicaClient`),
 `tests/integration_minio.rs`. Behavior ported from `s3/replica_client.go`; the
