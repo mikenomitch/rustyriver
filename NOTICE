@@ -1,0 +1,15 @@
+rustyriver
+Copyright 2026 The rustyriver authors
+
+This product is a from-scratch Rust reimplementation of Litestream v0.5
+(https://github.com/benbjohnson/litestream), pinned to tag v0.5.11, and of the
+LTX file format defined by github.com/superfly/ltx (tag v0.5.1).
+
+Litestream is Copyright (c) Ben Johnson and the Litestream authors, licensed
+under the Apache License, Version 2.0. The LTX format and reference
+implementation are Copyright (c) Superfly, Inc., licensed under the Apache
+License, Version 2.0.
+
+This project ports behavior and test vectors from those works for the purpose
+of wire-compatible interoperability (PLAN.md D-1). The upstream sources are
+vendored read-only under reference/ for reference and differential testing.

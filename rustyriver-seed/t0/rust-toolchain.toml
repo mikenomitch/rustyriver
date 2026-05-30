@@ -1,6 +1,0 @@
-# Pinned for CI determinism (PLAN.md D-10). Bump to latest stable at seed time
-# if desired; CI installs exactly this channel via `rustup show`.
-[toolchain]
-channel = "1.84.0"
-components = ["rustfmt", "clippy"]
-profile = "minimal"

@@ -1,0 +1,22 @@
+{
+  "project_name": "Litestream",
+  "description": "Standalone disaster recovery tool for SQLite",
+
+  "auto_formatting": {
+    "enabled": true,
+    "markdown": {
+      "enabled": true,
+      "tool": "markdownlint"
+    },
+    "json": {
+      "enabled": true,
+      "tool": "jq"
+    }
+  },
+
+  "file_permissions": {
+    "read_only_patterns": [
+      "*.pdf"
+    ]
+  }
+}

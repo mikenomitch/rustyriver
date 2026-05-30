@@ -1,0 +1,63 @@
+# Litestream
+
+Disaster recovery tool for SQLite. Replicates WAL changes to S3, GCS, Azure, SFTP, or local filesystem.
+
+## Quick Start for AI Contributors
+
+1. Read [AI_PR_GUIDE.md](AI_PR_GUIDE.md) - PR quality requirements
+2. Read [AGENTS.md](AGENTS.md) - Project overview and checklist
+3. Check [CONTRIBUTING.md](CONTRIBUTING.md) - What we accept
+4. Show investigation evidence in PRs
+
+## PR Checklist
+
+- [ ] Evidence of problem (logs, file patterns)
+- [ ] Clear scope (what PR does/doesn't do)
+- [ ] Runnable test commands
+- [ ] Race detector tested (`go test -race`)
+
+## Documentation
+
+| Document | Purpose |
+|----------|---------|
+| [AGENTS.md](AGENTS.md) | Project overview, critical rules |
+| [AI_PR_GUIDE.md](AI_PR_GUIDE.md) | PR templates, common mistakes |
+| [docs/PATTERNS.md](docs/PATTERNS.md) | Code patterns and anti-patterns |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Component details |
+| [docs/SQLITE_INTERNALS.md](docs/SQLITE_INTERNALS.md) | WAL format, 1GB lock page |
+| [docs/LTX_FORMAT.md](docs/LTX_FORMAT.md) | Replication format |
+| [docs/TESTING_GUIDE.md](docs/TESTING_GUIDE.md) | Test strategies |
+| [docs/REPLICA_CLIENT_GUIDE.md](docs/REPLICA_CLIENT_GUIDE.md) | Storage backends |
+
+## Core Files
+
+| File | Purpose |
+|------|---------|
+| `db.go` | Database monitoring, WAL, checkpoints |
+| `replica.go` | Replication management |
+| `store.go` | Multi-database coordination |
+| `replica_client.go` | Storage backend interface |
+
+## Storage Backends
+
+- `s3/replica_client.go` - AWS S3
+- `gs/replica_client.go` - Google Cloud Storage
+- `abs/replica_client.go` - Azure Blob Storage
+- `sftp/replica_client.go` - SFTP
+- `file/replica_client.go` - Local filesystem
+- `nats/replica_client.go` - NATS JetStream
+
+## Critical Concepts
+
+- **Lock page at 1GB** - Always skip page at 0x40000000
+- **LTX files are immutable** - Never modify after creation
+- **Single replica per DB** - One destination per database
+- **Layer boundaries** - DB handles state, Replica handles replication
+
+## Build
+
+```bash
+go build -o bin/litestream ./cmd/litestream
+go test -race -v ./...
+pre-commit run --all-files
+```

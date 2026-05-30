@@ -1,0 +1,517 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g., v0.3.14)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  packages: write
+  id-token: write
+
+jobs:
+  goreleaser:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install cross-compilers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf gcc-arm-linux-gnueabi
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Install Syft for SBOM generation
+        uses: anchore/sbom-action/download-syft@v0
+        with:
+          syft-version: latest
+
+      - name: Import GPG key
+        if: ${{ env.GPG_PRIVATE_KEY != '' }}
+        id: import_gpg
+        uses: crazy-max/ghaction-import-gpg@v6
+        with:
+          gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
+          passphrase: ${{ secrets.GPG_PASSPHRASE }}
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: latest
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GPG_FINGERPRINT: ${{ steps.import_gpg.outputs.fingerprint }}
+          HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+
+  vfs-build-linux:
+    name: Build VFS (Linux ${{ matrix.arch }})
+    runs-on: ubuntu-22.04  # glibc 2.35 (ubuntu-20.04 runners deprecated)
+    needs: goreleaser
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install cross-compiler (arm64)
+        if: matrix.arch == 'arm64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Get version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "version=${{ inputs.tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build VFS extension
+        run: make vfs-linux-${{ matrix.arch }}
+
+      - name: Verify artifact
+        run: |
+          file dist/litestream-vfs-linux-${{ matrix.arch }}.so
+          # For native arch, verify it can be loaded by SQLite
+          if [ "${{ matrix.arch }}" == "amd64" ]; then
+            sqlite3 ':memory:' ".load dist/litestream-vfs-linux-amd64.so" ".exit" && echo "Extension loads successfully"
+          fi
+          # For cross-compiled arch, verify ELF header and architecture
+          if [ "${{ matrix.arch }}" == "arm64" ]; then
+            readelf -h dist/litestream-vfs-linux-arm64.so | grep -E "(Class|Machine)"
+            echo "ARM64 ELF header verified"
+          fi
+
+      - name: Create archive
+        run: |
+          cd dist
+          cp litestream-vfs-linux-${{ matrix.arch }}.so litestream.so
+          tar -czvf litestream-vfs-${{ steps.version.outputs.version }}-linux-${{ matrix.arch }}.tar.gz \
+            litestream.so
+
+      - name: Generate checksum
+        run: |
+          cd dist
+          sha256sum litestream-vfs-${{ steps.version.outputs.version }}-linux-${{ matrix.arch }}.tar.gz \
+            > litestream-vfs-${{ steps.version.outputs.version }}-linux-${{ matrix.arch }}.tar.gz.sha256
+
+      - name: Upload to release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload ${{ steps.version.outputs.version }} \
+            dist/litestream-vfs-${{ steps.version.outputs.version }}-linux-${{ matrix.arch }}.tar.gz \
+            dist/litestream-vfs-${{ steps.version.outputs.version }}-linux-${{ matrix.arch }}.tar.gz.sha256 \
+            --clobber
+
+      - name: Upload artifact for packaging
+        uses: actions/upload-artifact@v4
+        with:
+          name: vfs-linux-${{ matrix.arch }}
+          path: dist/litestream-vfs-linux-${{ matrix.arch }}.so
+
+  vfs-build-darwin:
+    name: Build VFS (macOS ${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    needs: goreleaser
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: macos-15
+          - arch: arm64
+            runner: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Get version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "version=${{ inputs.tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build VFS extension
+        run: make vfs-darwin-${{ matrix.arch }}
+
+      - name: Verify artifact
+        run: |
+          file dist/litestream-vfs-darwin-${{ matrix.arch }}.dylib
+          # Verify architecture matches target
+          lipo -info dist/litestream-vfs-darwin-${{ matrix.arch }}.dylib
+          # Verify the expected symbol exists (macOS sqlite3 doesn't support .load)
+          nm -gU dist/litestream-vfs-darwin-${{ matrix.arch }}.dylib | grep sqlite3_litestreamvfs_init && echo "Entry point symbol found"
+
+      - name: Create archive
+        run: |
+          cd dist
+          cp litestream-vfs-darwin-${{ matrix.arch }}.dylib litestream.dylib
+          tar -czvf litestream-vfs-${{ steps.version.outputs.version }}-darwin-${{ matrix.arch }}.tar.gz \
+            litestream.dylib
+
+      - name: Generate checksum
+        run: |
+          cd dist
+          shasum -a 256 litestream-vfs-${{ steps.version.outputs.version }}-darwin-${{ matrix.arch }}.tar.gz \
+            > litestream-vfs-${{ steps.version.outputs.version }}-darwin-${{ matrix.arch }}.tar.gz.sha256
+
+      - name: Upload to release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload ${{ steps.version.outputs.version }} \
+            dist/litestream-vfs-${{ steps.version.outputs.version }}-darwin-${{ matrix.arch }}.tar.gz \
+            dist/litestream-vfs-${{ steps.version.outputs.version }}-darwin-${{ matrix.arch }}.tar.gz.sha256 \
+            --clobber
+
+      - name: Upload artifact for packaging
+        uses: actions/upload-artifact@v4
+        with:
+          name: vfs-darwin-${{ matrix.arch }}
+          path: dist/litestream-vfs-darwin-${{ matrix.arch }}.dylib
+
+  # macos-sign:
+  #   runs-on: macos-latest
+  #   needs: goreleaser
+  #   strategy:
+  #     matrix:
+  #       arch: [amd64, arm64]
+  #   steps:
+  #     - name: Checkout
+  #       uses: actions/checkout@v4
+
+  #     - name: Set up Go
+  #       uses: actions/setup-go@v5
+  #       with:
+  #         go-version-file: go.mod
+
+  #     - name: Download release artifacts
+  #       uses: actions/download-artifact@v4
+  #       with:
+  #         name: litestream-darwin-${{ matrix.arch }}
+  #         path: dist/
+
+  #     - name: Import Apple Developer Certificate
+  #       env:
+  #         MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+  #         MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+  #       run: |
+  #         echo "$MACOS_CERTIFICATE" | base64 --decode > certificate.p12
+  #         security create-keychain -p actions temp.keychain
+  #         security default-keychain -s temp.keychain
+  #         security unlock-keychain -p actions temp.keychain
+  #         security import certificate.p12 -k temp.keychain -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+  #         security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k actions temp.keychain
+
+  #     - name: Sign and Notarize
+  #       env:
+  #         APPLE_API_KEY: ${{ secrets.APPLE_API_KEY_P8 }}
+  #         APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+  #         APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+  #         AC_PASSWORD: ${{ secrets.AC_PASSWORD }}
+  #       run: |
+  #         gon etc/gon-${{ matrix.arch }}.hcl
+
+  #     - name: Upload signed binary
+  #       env:
+  #         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  #       run: |
+  #         gh release upload ${{ github.ref_name }} dist/litestream-*-darwin-${{ matrix.arch }}.zip
+
+  # windows-sign:
+  #   runs-on: windows-latest
+  #   needs: goreleaser
+  #   strategy:
+  #     matrix:
+  #       arch: [amd64, arm64]
+  #   steps:
+  #     - name: Checkout
+  #       uses: actions/checkout@v4
+  #
+  #     - name: Download release artifacts
+  #       uses: actions/download-artifact@v4
+  #       with:
+  #         name: litestream-windows-${{ matrix.arch }}
+  #         path: dist/
+  #
+  #     - name: Sign Windows binary
+  #       env:
+  #         WINDOWS_CERTIFICATE_PFX: ${{ secrets.WINDOWS_CERTIFICATE_PFX }}
+  #         WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+  #       run: |
+  #         echo "$env:WINDOWS_CERTIFICATE_PFX" | base64 -d > cert.pfx
+  #         & signtool sign /f cert.pfx /p "$env:WINDOWS_CERTIFICATE_PASSWORD" /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com dist\litestream.exe
+  #         Remove-Item cert.pfx
+  #
+  #     - name: Upload signed binary
+  #       env:
+  #         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  #       run: |
+  #         gh release upload ${{ github.ref_name }} dist\litestream-*-windows-${{ matrix.arch }}.zip
+
+  publish-pypi:
+    name: Publish to PyPI (${{ matrix.os }}-${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    needs: [vfs-build-linux, vfs-build-darwin]
+    environment: release
+    permissions:
+      id-token: write
+    strategy:
+      matrix:
+        include:
+          - os: linux
+            arch: amd64
+            ext: so
+            src_name: litestream-vfs-linux-amd64.so
+            dest_name: litestream-vfs.so
+            platform_tag: manylinux_2_35_x86_64
+          - os: linux
+            arch: arm64
+            ext: so
+            src_name: litestream-vfs-linux-arm64.so
+            dest_name: litestream-vfs.so
+            platform_tag: manylinux_2_35_aarch64
+          - os: darwin
+            arch: amd64
+            ext: dylib
+            src_name: litestream-vfs-darwin-amd64.dylib
+            dest_name: litestream-vfs.dylib
+            platform_tag: macosx_11_0_x86_64
+          - os: darwin
+            arch: arm64
+            ext: dylib
+            src_name: litestream-vfs-darwin-arm64.dylib
+            dest_name: litestream-vfs.dylib
+            platform_tag: macosx_11_0_arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download VFS artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: vfs-${{ matrix.os }}-${{ matrix.arch }}
+          path: packages/python/litestream_vfs/
+
+      - name: Rename binary
+        run: |
+          mv packages/python/litestream_vfs/${{ matrix.src_name }} \
+             packages/python/litestream_vfs/${{ matrix.dest_name }}
+
+      - name: Get version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            VERSION="${{ inputs.tag }}"
+          else
+            VERSION="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "version=${VERSION#v}" >> $GITHUB_OUTPUT
+
+      - name: Build wheel
+        run: |
+          cd packages/python
+          pip install setuptools wheel
+          LITESTREAM_VERSION=${{ steps.version.outputs.version }} python setup.py bdist_wheel
+
+      - name: Rename wheel with platform tag
+        run: |
+          cd packages/python
+          python scripts/rename_wheel.py dist ${{ matrix.platform_tag }}
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: packages/python/dist/
+
+  publish-npm:
+    name: Publish to npm
+    runs-on: ubuntu-latest
+    needs: [vfs-build-linux, vfs-build-darwin]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Download all VFS artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Copy binaries to platform packages
+        run: |
+          cp artifacts/vfs-linux-amd64/litestream-vfs-linux-amd64.so \
+             packages/npm/litestream-vfs-linux-amd64/litestream-vfs.so
+          cp artifacts/vfs-linux-arm64/litestream-vfs-linux-arm64.so \
+             packages/npm/litestream-vfs-linux-arm64/litestream-vfs.so
+          cp artifacts/vfs-darwin-amd64/litestream-vfs-darwin-amd64.dylib \
+             packages/npm/litestream-vfs-darwin-amd64/litestream-vfs.dylib
+          cp artifacts/vfs-darwin-arm64/litestream-vfs-darwin-arm64.dylib \
+             packages/npm/litestream-vfs-darwin-arm64/litestream-vfs.dylib
+
+      - name: Get version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            VERSION="${{ inputs.tag }}"
+          else
+            VERSION="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "version=${VERSION#v}" >> $GITHUB_OUTPUT
+
+      - name: Set versions
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+          for dir in packages/npm/litestream-vfs-*/; do
+            jq --arg v "$VERSION" '.version = $v' "$dir/package.json" > tmp.json && mv tmp.json "$dir/package.json"
+          done
+          jq --arg v "$VERSION" '
+            .version = $v |
+            .optionalDependencies = (.optionalDependencies | to_entries | map(.value = $v) | from_entries)
+          ' packages/npm/litestream-vfs/package.json > tmp.json && mv tmp.json packages/npm/litestream-vfs/package.json
+
+      - name: Publish platform packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          for dir in packages/npm/litestream-vfs-*/; do
+            cd "$dir"
+            npm publish --access public
+            cd -
+          done
+
+      - name: Wait for registry propagation
+        run: sleep 30
+
+      - name: Publish main package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          cd packages/npm/litestream-vfs
+          npm publish --access public
+
+  publish-gem:
+    name: Publish to RubyGems (${{ matrix.os }}-${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    needs: [vfs-build-linux, vfs-build-darwin]
+    strategy:
+      matrix:
+        include:
+          - os: linux
+            arch: amd64
+            ext: so
+            src_name: litestream-vfs-linux-amd64.so
+            dest_name: litestream-vfs.so
+            platform: x86_64-linux
+          - os: linux
+            arch: arm64
+            ext: so
+            src_name: litestream-vfs-linux-arm64.so
+            dest_name: litestream-vfs.so
+            platform: aarch64-linux
+          - os: darwin
+            arch: amd64
+            ext: dylib
+            src_name: litestream-vfs-darwin-amd64.dylib
+            dest_name: litestream-vfs.dylib
+            platform: x86_64-darwin
+          - os: darwin
+            arch: arm64
+            ext: dylib
+            src_name: litestream-vfs-darwin-arm64.dylib
+            dest_name: litestream-vfs.dylib
+            platform: arm64-darwin
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+
+      - name: Download VFS artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: vfs-${{ matrix.os }}-${{ matrix.arch }}
+          path: packages/ruby/lib/
+
+      - name: Rename binary
+        run: |
+          mv packages/ruby/lib/${{ matrix.src_name }} \
+             packages/ruby/lib/${{ matrix.dest_name }}
+
+      - name: Get version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            VERSION="${{ inputs.tag }}"
+          else
+            VERSION="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "version=${VERSION#v}" >> $GITHUB_OUTPUT
+
+      - name: Build gem
+        run: |
+          cd packages/ruby
+          LITESTREAM_VERSION=${{ steps.version.outputs.version }} \
+          PLATFORM=${{ matrix.platform }} \
+          gem build litestream-vfs.gemspec
+
+      - name: Publish to RubyGems
+        env:
+          GEM_HOST_API_KEY: ${{ secrets.RUBYGEMS_API_KEY }}
+        run: |
+          cd packages/ruby
+          gem push litestream-vfs-*.gem
