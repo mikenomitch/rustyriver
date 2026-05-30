@@ -314,7 +314,10 @@ pub fn wal_checksum(big_endian: bool, s0: u32, s1: u32, b: &[u8]) -> (u32, u32) 
 ///
 /// The returned path ends in a slash only if it is the root `"/"`.  An empty
 /// input returns `"."`.
-fn path_clean(path: &str) -> String {
+///
+/// `pub(crate)` so `replica_url::clean_replica_url_path` (T3) can reuse Go's
+/// `path.Clean` semantics rather than reimplementing them.
+pub(crate) fn path_clean(path: &str) -> String {
     if path.is_empty() {
         return ".".to_string();
     }
