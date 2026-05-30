@@ -143,6 +143,106 @@ fn test_ltx_level_dir() {
     assert_eq!(ltx_level_dir("foo", 0), "foo/ltx/0");
 }
 
+// ── REVIEWER (T4): path.Join normalization divergence ─────────────────────────
+//
+// Upstream `LTXDir`/`LTXLevelDir`/`LTXFilePath` (litestream@v0.5.11
+// litestream.go:184-197) build their paths with Go's `path.Join`, which CLEANS
+// the result: it collapses repeated separators, resolves "." / "..", and strips
+// trailing slashes. The Rust port (lib.rs `ltx_dir` etc.) instead uses
+// `format!("{}/ltx", root)`, naive string concatenation that performs no
+// cleaning. The single ported happy-path test only exercises root="foo", so the
+// divergence is silently uncovered.
+//
+// The expected values below were produced by running the real Go helpers
+// (path.Join) — they are the source-of-truth oracle, NOT rustyriver output:
+//
+//   LTXDir("foo/")      = "foo/ltx"        (Rust currently: "foo//ltx")
+//   LTXDir("foo//bar")  = "foo/bar/ltx"    (Rust currently: "foo//bar/ltx")
+//   LTXDir("foo/..")    = "ltx"            (Rust currently: "foo/../ltx")
+//   LTXLevelDir("foo/",0) = "foo/ltx/0"    (Rust currently: "foo//ltx/0")
+//
+// Why this matters: these helpers compute LTX object-store keys. On S3-style
+// stores "foo//ltx/0/..." and "foo/ltx/0/..." are DIFFERENT keys, so a root
+// carrying a trailing slash (a common prefix form) makes rustyriver read/write a
+// different key than the real binary — breaking the differential oracle (G3,
+// PLAN.md §6.3 D1/D3). A faithful port must replicate path.Join's cleaning.
+#[test]
+fn test_ltx_dir_normalizes_like_path_join() {
+    // Trailing slash on the root: path.Join collapses the doubled separator.
+    assert_eq!(
+        ltx_dir("foo/"),
+        "foo/ltx",
+        "LTXDir must clean trailing slash like Go path.Join (litestream.go:185)"
+    );
+    // Doubled internal separator.
+    assert_eq!(
+        ltx_dir("foo//bar"),
+        "foo/bar/ltx",
+        "LTXDir must collapse repeated separators like Go path.Join"
+    );
+    // Level dir inherits the same cleaning.
+    assert_eq!(
+        ltx_level_dir("foo/", 0),
+        "foo/ltx/0",
+        "LTXLevelDir must clean like Go path.Join (litestream.go:190-191)"
+    );
+}
+
+// ── REVIEWER (T1 review): path.Clean ".." backtrack divergence ────────────────
+//
+// The sibling test above only exercises trailing/doubled-slash collapsing, which
+// the current `path_clean` (src/lib.rs) handles. It does NOT exercise a `..`
+// element that backtracks over a *surviving* prefix element — and that path is
+// BROKEN: the backtrack loop pops the element body but leaves the preceding '/'
+// in the buffer (Go's `lazybuf` cursor logically excludes it), so the next
+// element is appended after a doubled separator.
+//
+// Demonstration (Rust currently, confirmed by running the code):
+//   path_clean("a/b/../c") = "a//c"   (Go path.Clean: "a/c")
+// observed via the public helper:
+//   ltx_dir("a/b/../c")   = "a//c/ltx"   (must be "a/c/ltx")
+//
+// EXPECTED VALUES ARE FROM THE REAL GO `path.Join` (the upstream oracle, run
+// with go1.25 against `path.Join(root, "ltx")`), never from rustyriver — per
+// AGENTS.md rule 3:
+//   path.Join("a/b/../c","ltx")   = "a/c/ltx"
+//   path.Join("x/y/../z","ltx")   = "x/z/ltx"
+//   path.Join("a/b/c/../d","ltx") = "a/b/d/ltx"
+//   path.Join("aa/bb/../cc","ltx")= "aa/cc/ltx"
+//
+// Why this matters: these helpers compute LTX object-store keys (litestream.go
+// 184-197). Any `root` whose cleaned form contains an interior `..` over a
+// surviving prefix (e.g. a configured prefix like "bucket/db/../ltxroot") yields
+// a doubled-slash S3 key ("bucket//ltxroot/...") — a DIFFERENT object than the
+// real binary writes/reads, silently breaking the differential oracle (G3,
+// PLAN.md §6.3 D1/D3). A faithful port must match Go's `path.Clean` exactly.
+#[test]
+fn test_ltx_dir_cleans_dotdot_over_surviving_prefix() {
+    // Interior ".." that backtracks over one element, leaving a prefix.
+    assert_eq!(
+        ltx_dir("a/b/../c"),
+        "a/c/ltx",
+        "path.Clean must collapse 'a/b/../c' to 'a/c' (no doubled separator)"
+    );
+    assert_eq!(
+        ltx_dir("x/y/../z"),
+        "x/z/ltx",
+        "path.Clean must collapse 'x/y/../z' to 'x/z'"
+    );
+    // Backtrack with two surviving prefix elements.
+    assert_eq!(
+        ltx_dir("a/b/c/../d"),
+        "a/b/d/ltx",
+        "path.Clean must collapse 'a/b/c/../d' to 'a/b/d'"
+    );
+    // Multi-char element names (rules out any single-byte coincidence).
+    assert_eq!(
+        ltx_level_dir("aa/bb/../cc", 0),
+        "aa/cc/ltx/0",
+        "path.Clean must collapse 'aa/bb/../cc' to 'aa/cc'"
+    );
+}
+
 // ── LTXFilePath ───────────────────────────────────────────────────────────────
 // litestream_test.go:60-65 declares a function named `LTXFilePath` (no Test
 // prefix), so Go's test runner never executes it; it also uses "-" as the

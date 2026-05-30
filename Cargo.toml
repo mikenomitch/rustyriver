@@ -39,6 +39,10 @@ futures = "0.3"
 # Lease object + config are JSON (PLAN.md §1 fencing).
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# LTX page blocks are LZ4-frame compressed (ltx@v0.5.1 encoder.go uses
+# pierrec/lz4 v4). lz4_flex is pure-Rust (no CGo) → fits the single-static-binary
+# goal (D-4 rationale). Added in T2; logged in OPEN_QUESTIONS.md (AGENTS.md rule 7).
+lz4_flex = { version = "0.11", features = ["frame"] }
 
 # NOTE: WAL uses SQLite's custom checksum (no crate); LTX uses a CRC the T2 spike
 # pins. Add the chosen checksum crate in T1/T2 and log it in OPEN_QUESTIONS.md

@@ -12,7 +12,7 @@ Cargo.lock.bak
 *.db-shm
 /scratch
 
-# Claude Code local settings / nested worktrees
+# Claude Code local settings / nested worktrees (personal — not committed)
 /.claude
 
 # OS

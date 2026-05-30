@@ -55,6 +55,46 @@ Non-blocking: crate/repo name `rustyriver`; no debug CLI in the one-shot.
 > **Conservative choice taken (if any):** `// DECISION:` summary, or "STOPPED — needs human".
 > **Needs from human:** the specific answer required to proceed.
 
+### 2026-05-30 — T2 — New runtime dependency `lz4_flex` (rule 7) + the NoChecksum finding
+**Context:** `src/ltx.rs`, `Cargo.toml`. Ported from ltx@v0.5.1 `encoder.go`/`decoder.go`/`checksum.go`.
+**Dependency (AGENTS.md rule 7):** LTX page blocks are LZ4-**frame** compressed
+(upstream uses `github.com/pierrec/lz4/v4`). Added **`lz4_flex` 0.11**
+(`features=["frame"]`) — pure-Rust, no CGo, preserving the single-static-binary
+goal (D-4 rationale). Verified interoperable with upstream frames: all six golden
+L0 files decode and their CRC64-ISO file checksums verify **byte-exact**. CRC64 is
+hand-rolled to match Go `crc64.MakeTable(crc64.ISO)` (poly `0xD800…`), proven by
+both a known check vector and the golden files.
+**Finding (not an ambiguity):** real litestream L0 WAL-segment LTX files set
+`HeaderFlagNoChecksum`, so the rolling post-apply checksum is **not** tracked at
+the LTX layer (it lives at the DB layer). `decode_file` always verifies the file
+checksum and verifies the post-apply checksum only when tracking is on. Asserted
+in the golden test so a future format change is caught.
+**Conservative choice / status:** none needed — byte-exact golden verification is
+the proof (rule 3). **Needs from human:** none; recorded for dep visibility (rule 7).
+
+### 2026-05-29 — T1 — Pre-existing T4 test failure blocks the repo-wide `cargo test --all` gate (NOT a T1 issue)
+**Context:** `tests/litestream_helpers.rs:170` `test_ltx_dir_normalizes_like_path_join`
+asserts `ltx_dir("foo/") == "foo/ltx"` (and the doubled-separator / level-dir
+variants). The current `ltx_dir` / `ltx_level_dir` in `src/lib.rs:299-308` use
+naive `format!("{}/ltx", root)`, so `ltx_dir("foo/")` yields `"foo//ltx"`. This
+is a faithful-port divergence from Go's `path.Join` (litestream.go:184-197), which
+CLEANS the result. It is a **T4** concern (`lib.rs` path helpers), not T1 (`wal.rs`).
+**Confirmed pre-existing:** the test fails on the baseline commit `b1218b0` with my
+`src/wal.rs` change stashed, so T1 neither introduced nor can resolve it.
+**Impact on T1:** the T1 module gate is green in isolation — `wal.rs` is 14/14
+(ported `wal_reader_test.go` cases + byte-exact golden `sample.wal`), and
+fmt/clippy/build/guards all pass. But the *repo-wide* `cargo test --all` is RED
+solely because of this T4 test, so a strict reading of "all five gate commands
+green" is not met by the whole tree.
+**Conservative choice taken:** STOPPED — did **not** touch the failing test or the
+`ltx_dir`/`ltx_level_dir` implementation (out of T1 scope; AGENTS.md rules 1 & 8
+forbid weakening a test or straying out of KEEP scope). Logged here so the T4
+fixer makes `ltx_dir`/`ltx_level_dir`/`ltx_file_path` normalize like Go
+`path.Join` (collapse repeated separators, resolve `.`/`..`, strip trailing slash).
+**Needs from human:** route the fix to T4 (path helpers in `src/lib.rs`). No T1
+action required; this entry only explains why the aggregate `cargo test --all`
+boolean is reported `false` in the T1 result.
+
 ### 2026-05-29 — T0 — Toolchain pin bumped 1.84.0 → 1.90.0 (D-10)
 **Context:** `rust-toolchain.toml`, `Cargo.toml` `rust-version`.
 **Ambiguity:** The seed pinned Rust 1.84.0, but the resolved dependency tree

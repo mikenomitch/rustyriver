@@ -14,11 +14,11 @@ in parallel; gates between waves are hard stops.
 - [x] **T0** Repo scaffold: Cargo, CI (§6.5), `AGENTS.md`/`PLAN.md`/`PROGRESS.md`/`OPEN_QUESTIONS.md`, vendor upstream @ `v0.5.11` into `reference/` (read-only), empty module + test files, `db_equal` oracle, `scripts/capture-golden.sh`. — *Done 2026-05-29: gate green (fmt/clippy/build/test); litestream v0.5.11 + ltx v0.5.1 vendored; `db_equal` A/B oracle self-tested; golden fixtures captured (L0 replica + WAL); real binary on PATH; U-1 (hand-roll) & U-2 (L0 restore) resolved.*
 
 ## Wave 1 — format foundation  → **GATE G1 (format) before Wave 2**
-- [ ] **T1** `wal.rs` — WAL header/frame parse + SQLite checksums. Port `wal_reader_test.go`. *(dep: T0)*
-- [ ] **T2** `ltx.rs` — LTX read/write, TXID, framing, checksums. Port `v3_test.go`. **D-6 spike** (crate vs hand-roll) + produce `reference/ltx-format.md` + **L0-restore spike** (Risk R-3). *(dep: T0)*
-- [ ] **T3** `replica_url.rs` — parse `s3://`, `file://`. Port `replica_url_test.go`. *(dep: T0)*
-- [ ] **T4** `error.rs` + `lib.rs` public-API skeleton + helpers. Port `litestream_test.go` helpers. *(dep: T0)*
-- [ ] **G1** wal + ltx unit **and golden** vectors pass byte-exact.
+- [x] **T1** `wal.rs` — WAL header/frame parse + SQLite checksums. Port `wal_reader_test.go`. *(dep: T0)* — *Done 2026-05-29 (workflow porter→reviewer→fixer): 14/14 ported `wal_reader_test.go` cases + the golden `sample.wal` decodes with every frame's SQLite checksum (salt-rotation) byte-exact.*
+- [x] **T2** `ltx.rs` — LTX read/write, TXID, framing, checksums. Port `v3_test.go`. **D-6 spike** (crate vs hand-roll) + produce `reference/ltx-format.md` + **L0-restore spike** (Risk R-3). *(dep: T0)* — *Done 2026-05-30 (inline): hand-rolled CRC64-ISO + `lz4_flex` frame codec; **all 6 golden L0 `.ltx` files decode and their file checksums verify byte-exact**; encode↔decode round-trip; `reference/ltx-format.md` written; D-6=hand-roll & U-2=L0-restore resolved. Dep `lz4_flex` logged in OPEN_QUESTIONS (rule 7).*
+- [ ] **T3** `replica_url.rs` — parse `s3://`, `file://`. Port `replica_url_test.go`. *(dep: T0)* — **NEXT (only remaining Wave 1 task).**
+- [x] **T4** `error.rs` + `lib.rs` public-API skeleton + helpers. Port `litestream_test.go` helpers. *(dep: T0)* — *Done 2026-05-29 (workflow): thiserror model + `TXID`/`Pos`/`Checksum`/`CHECKSUM_FLAG`/WAL+SQLite constants + Go `path.Join`-faithful `ltx_dir`/`path_clean` (incl. `..` backtracking); 24 ported `litestream_test.go` helper tests pass.*
+- [x] **G1 (format)** wal + ltx unit **and golden** vectors pass byte-exact. — *Met 2026-05-30: `cargo test --all` = 46 pass / 0 fail (incl. byte-exact WAL + LTX golden); fmt + clippy (`--all-targets --all-features -D warnings`) + guards green. Full clean-checkout re-verification noted below.*
 
 ## Wave 2 — core
 - [ ] **T5** `client/mod.rs` — `ReplicaClient` trait + generic conformance suite. Port `replica_client_test.go`. *(dep: T2)*

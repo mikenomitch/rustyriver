@@ -289,22 +289,168 @@ pub fn wal_checksum(big_endian: bool, s0: u32, s1: u32, b: &[u8]) -> (u32, u32) 
     (s0, s1)
 }
 
+// ── Forward-slash path cleaning (Go stdlib `path`) ────────────────────────────
+//
+// The LTX path helpers below build object-store keys with Go's `path.Join`
+// (NOT `filepath.Join`): the OS-independent, always-`/` package in
+// `go/src/path/path.go`.  `path.Join` concatenates non-empty elements with a
+// single `/` then runs the result through `path.Clean`, which collapses
+// repeated separators, resolves `.`/`..`, and strips trailing slashes.  A
+// naive `format!("{}/ltx", root)` skips this cleaning, so a root carrying a
+// trailing slash (e.g. an S3 prefix `"backups/"`) would yield a DIFFERENT
+// object key than the real binary (`"backups//ltx"` vs `"backups/ltx"`),
+// breaking the differential oracle.  We port `Clean`/`Join` byte-for-byte.
+
+/// Lexically cleans a slash-separated path.
+///
+/// A faithful port of `Clean` in the Go standard library `path` package
+/// (`go/src/path/path.go`, `func Clean`).  It applies these rules iteratively
+/// until no further processing is possible:
+///   1. Replace multiple slashes with a single slash.
+///   2. Eliminate each `.` path-name element (the current directory).
+///   3. Eliminate each inner `..` element along with the non-`..` element
+///      preceding it.
+///   4. Eliminate `..` elements that begin a rooted path (i.e. `/..` → `/`).
+///
+/// The returned path ends in a slash only if it is the root `"/"`.  An empty
+/// input returns `"."`.
+fn path_clean(path: &str) -> String {
+    if path.is_empty() {
+        return ".".to_string();
+    }
+
+    let bytes = path.as_bytes();
+    let rooted = bytes[0] == b'/';
+    let n = bytes.len();
+
+    // Mirror Go's `lazybuf` with an explicit write cursor `w` over a fully
+    // allocated buffer (we do not bother with Go's lazy aliasing optimisation,
+    // but we DO preserve its cursor semantics, which the previous Vec-length
+    // port got wrong).  `dotdot` marks the index below which `..` elements may
+    // not backtrack.  The output is `buf[..w]`, so the byte at index `w` is the
+    // next byte to be written — and is logically NOT part of the output yet.
+    //
+    // The backtrack loop must read `buf[w]` (the byte the cursor lands on),
+    // NOT `buf[w-1]`: when it stops on a separator, that separator sits at
+    // index `w` and is therefore EXCLUDED from `buf[..w]`.  A Vec-length model
+    // that inspects `out.last()` (i.e. `buf[w-1]`) instead leaves the surviving
+    // separator in the buffer, doubling it before the next element — the bug
+    // this rewrite fixes.  See `go/src/path/path.go` `func Clean` / `lazybuf`.
+    let mut buf: Vec<u8> = vec![0u8; n];
+    let mut w = 0usize;
+    let mut r = 0usize;
+    let mut dotdot = 0usize;
+    if rooted {
+        buf[w] = b'/';
+        w += 1;
+        r = 1;
+        dotdot = 1;
+    }
+
+    while r < n {
+        if bytes[r] == b'/' {
+            // empty path element
+            r += 1;
+        } else if bytes[r] == b'.' && (r + 1 == n || bytes[r + 1] == b'/') {
+            // `.` element
+            r += 1;
+        } else if bytes[r] == b'.'
+            && r + 1 < n
+            && bytes[r + 1] == b'.'
+            && (r + 2 == n || bytes[r + 2] == b'/')
+        {
+            // `..` element: remove to last `/`
+            r += 2;
+            if w > dotdot {
+                // can backtrack: step back over the just-ended element body,
+                // then keep stepping while the byte at the cursor is not '/'.
+                // When this stops on a '/', the cursor rests AT that '/', so it
+                // is excluded from `buf[..w]` (matching Go's `out.w` semantics).
+                w -= 1;
+                while w > dotdot && buf[w] != b'/' {
+                    w -= 1;
+                }
+            } else if !rooted {
+                // cannot backtrack, but not rooted, so append `..` element.
+                if w > 0 {
+                    buf[w] = b'/';
+                    w += 1;
+                }
+                buf[w] = b'.';
+                w += 1;
+                buf[w] = b'.';
+                w += 1;
+                dotdot = w;
+            }
+        } else {
+            // real path element; add slash if needed
+            if (rooted && w != 1) || (!rooted && w != 0) {
+                buf[w] = b'/';
+                w += 1;
+            }
+            // copy element
+            while r < n && bytes[r] != b'/' {
+                buf[w] = bytes[r];
+                w += 1;
+                r += 1;
+            }
+        }
+    }
+
+    // Turn empty string into "."
+    if w == 0 {
+        return ".".to_string();
+    }
+    buf.truncate(w);
+    // SAFETY-free: `buf` is built only from ASCII `/`, `.`, and bytes copied
+    // verbatim from the valid-UTF-8 `path`, so it is always valid UTF-8.
+    String::from_utf8(buf).expect("path_clean produced valid UTF-8")
+}
+
+/// Joins any number of path elements into a single slash-separated path,
+/// cleaning the result.
+///
+/// A faithful port of `Join` in the Go standard library `path` package
+/// (`go/src/path/path.go`, `func Join`): empty elements are ignored, and the
+/// joined string is passed through [`path_clean`].
+fn path_join(elem: &[&str]) -> String {
+    // Go returns "" when the total length of all elements is zero (which, since
+    // empty elements are skipped, means every element is empty).
+    if elem.iter().all(|e| e.is_empty()) {
+        return String::new();
+    }
+    let mut buf = String::new();
+    for &e in elem {
+        if !buf.is_empty() || !e.is_empty() {
+            if !buf.is_empty() {
+                buf.push('/');
+            }
+            buf.push_str(e);
+        }
+    }
+    path_clean(&buf)
+}
+
 // ── LTX path helpers ──────────────────────────────────────────────────────────
 //
 // Ported from litestream@v0.5.11 litestream.go:184-197.
 
 /// Returns the path to the LTX directory under a given root.
 ///
-/// Ported from `LTXDir` in litestream@v0.5.11 litestream.go:185.
+/// Ported from `LTXDir` in litestream@v0.5.11 litestream.go:185:
+/// `return path.Join(root, "ltx")`.
 pub fn ltx_dir(root: &str) -> String {
-    format!("{}/ltx", root)
+    path_join(&[root, "ltx"])
 }
 
 /// Returns the path to the LTX level sub-directory.
 ///
-/// Ported from `LTXLevelDir` in litestream@v0.5.11 litestream.go:190.
+/// Ported from `LTXLevelDir` in litestream@v0.5.11 litestream.go:190-191:
+/// `return path.Join(LTXDir(root), strconv.Itoa(level))`.  Note the
+/// composition over the already-cleaned `LTXDir(root)`, which we preserve so
+/// `..` resolution matches Go exactly.
 pub fn ltx_level_dir(root: &str, level: u32) -> String {
-    format!("{}/ltx/{}", root, level)
+    path_join(&[&ltx_dir(root), &level.to_string()])
 }
 
 /// Returns the path to a single LTX file for a given transaction range.
@@ -312,13 +458,11 @@ pub fn ltx_level_dir(root: &str, level: u32) -> String {
 /// The filename follows the convention `<minTXID>-<maxTXID>.ltx` with both
 /// TXIDs formatted as 16-digit lowercase hex.
 ///
-/// Ported from `LTXFilePath` in litestream@v0.5.11 litestream.go:195 and
-/// `FormatFilename` in ltx@v0.5.1 ltx.go:487.
+/// Ported from `LTXFilePath` in litestream@v0.5.11 litestream.go:195-196:
+/// `return path.Join(LTXLevelDir(root, level), ltx.FormatFilename(minTXID, maxTXID))`
+/// and `FormatFilename` in ltx@v0.5.1 ltx.go:487
+/// (`fmt.Sprintf("%s-%s.ltx", minTXID.String(), maxTXID.String())`).
 pub fn ltx_file_path(root: &str, level: u32, min_txid: TXID, max_txid: TXID) -> String {
-    format!(
-        "{}/{}-{}.ltx",
-        ltx_level_dir(root, level),
-        min_txid,
-        max_txid
-    )
+    let filename = format!("{}-{}.ltx", min_txid, max_txid);
+    path_join(&[&ltx_level_dir(root, level), &filename])
 }
