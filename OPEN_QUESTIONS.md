@@ -48,7 +48,76 @@ Non-blocking: crate/repo name `rustyriver`; no debug CLI in the one-shot.
 
 ## Escalations log (agent appends; newest first)
 
+### 2026-05-30 — T13 — Differential gate G3 vs the real `litestream` binary: PASS (both directions, byte-identical) + deferrals
+**Context:** `tests/differential_xtool.rs` (the D1/D2/D3 cross-tool differential
+suite, PLAN.md §6.3). Drives the **real `litestream` binary** (a from-source
+development build of the pinned tag v0.5.11, on PATH) via `std::process::Command`
++ the `scripts/db_equal.sh` A/B oracle, over a file replica. **No new `src/`
+code** — the LTX format and restore algorithm were already real-Litestream-
+compatible (proven byte-exact at T2 golden + anchored at T10/G2); this task is the
+*proof* that closes G3 ("M1 correct"). All 5 cases pass:
+- **D1** our `Replica::sync` write → real `litestream restore` → Oracle A vs source.
+- **D2** real `litestream replicate -once` → our `replica::restore` → Oracle A vs source.
+- **D3** (×2) both tools restore the SAME tree → byte-identical main DB (Oracle B,
+  after TRUNCATE), over both a rustyriver-written and a real-written replica.
+- **D2 @ target TXID** our point-in-time restore == real `litestream restore -txid`.
+
+**Finding (not an ambiguity) — `litestream restore -txid` requires the full
+16-char zero-padded hex form.** The real binary rejects a short hex TXID
+(`-txid 3` → `invalid txid format`) and accepts only `-txid 0000000000000003`
+(empirically confirmed). The test formats the target as `format!("{:016x}", …)`,
+matching upstream's `ltx.ParseTXID`/16-nibble rendering. Recorded so the future
+debug-CLI (out of one-shot scope) and any `-txid` plumbing use the padded form.
+
+**DECISION — drive the real binary deterministically with `replicate -once` (not a
+background replicate + sleep).** Each workload statement-group is written via a
+plain `sqlite3`/`rusqlite` connection, then flushed with a single
+`litestream replicate -once DB file://<abs>` — the same race-free method
+`scripts/capture-golden.sh` uses. This makes the produced L0 chain deterministic
+(snapshot at TXID 1 + one incremental per group) with no timing flakiness, which is
+required for the byte-identical Oracle-B D3 assertions. (`// DECISION` in the test's
+`litestream_replicate` doc-comment.)
+
+**DECISION — the differential suite runs over the FILE replica, not MinIO.** D1–D3
+prove *format* + *restore-algorithm* fidelity, which are transport-agnostic; the
+file `ReplicaClient` writes byte-for-byte the same object layout
+(`<root>/ltx/<level>/<min>-<max>.ltx`) the S3 client does, and the real binary's
+`file://` backend reads/writes that identical tree — so a file replica is the
+cleanest hermetic way to put both tools on the *same* bytes (and lets D3's Oracle B
+be meaningful). The S3/MinIO transport is already proven end-to-end live by T7
+(`integration_minio.rs`). A MinIO mirror of the differential suite would add
+transport coverage but no new format/restore coverage; see deferral 1.
+
+**Honest skip, not a silent pass (AGENTS.md rules 1-2).** Every test is gated on
+both `litestream` AND `sqlite3` being on PATH; absent either, it logs a skip note
+and `return`s (a runtime guard, NOT a `#[ignore]` attribute, and no assertion is
+weakened). Proven honest: running the prebuilt test binary under a PATH that lacks
+`litestream` skips all 5 in 0.00s, while with the binary present they execute real
+differential work (~0.9s) and pass — so they cannot be accidentally always-skipping.
+In this run the binary was present and the gate actually ran.
+
+**DEFERRED (logged, NOT on the G3 functional path):**
+1. **MinIO mirror of D1/D2/D3.** Per the DECISION above, the file replica is the
+   identical object layout and the S3/MinIO transport is already covered live by
+   T7. Re-running D1–D3 over MinIO is a natural T16/hardening add if a
+   MinIO-specific CAS/ETag/range-GET format gap is ever suspected; it adds no new
+   format/restore-logic coverage. (PLAN.md D-3 lists MinIO for the differential
+   *job*; the file backend satisfies the format-fidelity intent hermetically.)
+2. **Timestamp-targeted differential (`restore -timestamp`).** Our public restore
+   path is TXID-targeted (the timestamp/PITR plumbing is itself a T10 deferral); the
+   D2-at-target-TXID case covers point-in-time selection by TXID against the real
+   tool. The `-timestamp` cross-check lands with the timestamp-restore surface at
+   T17, alongside the file-client mtime-preservation deferral (T5/T6).
+3. **`-config`-file-driven replicate (multi-DB / retention).** The differential
+   suite uses the single-DB positional CLI form (`replicate DB REPLICA_URL`), which
+   exercises the exact KEEP-scope path. Config-file orchestration, multi-replica
+   fan-out, and `-enforce-retention` are out of the one-shot scope (PLAN.md §2).
+**Needs from human:** none — G3 is met both directions with byte-identical format
+fidelity; all choices are conservative and proven against the real binary (the
+authoritative oracle, AGENTS.md rule 3).
+
 ### 2026-05-30 — T15 — Leaser (lease fencing): conditional-DELETE deviation + RFC3339 serde + reqwest dep + deferrals
+**Context:** `src/leaser.rs` (the object-storage lease acquire/renew/release +
 **Context:** `src/leaser.rs` (the object-storage lease acquire/renew/release +
 expiry→failover primitive), `Cargo.toml` (+ optional `reqwest`). Behavior ported
 from `leaser.go` + `heartbeat.go` + `s3/leaser.go`; the transport is the
