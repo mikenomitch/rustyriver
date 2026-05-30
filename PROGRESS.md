@@ -21,13 +21,13 @@ in parallel; gates between waves are hard stops.
 - [x] **G1 (format)** wal + ltx unit **and golden** vectors pass byte-exact. — *Met 2026-05-30, re-verified from a fresh `git clone` @ `50bb1ec`: `cargo test --all` = 46 pass / 0 fail (incl. byte-exact WAL + LTX golden); fmt + clippy (`--all-targets --all-features -D warnings`) + guards all green. NOTE: T3 (`replica_url.rs`) is still pending; it does not feed G1's wal/ltx criterion but must land before Wave 1 is fully complete.*
 
 ## Wave 2 — core
-- [ ] **T5** `client/mod.rs` — `ReplicaClient` trait + generic conformance suite. Port `replica_client_test.go`. *(dep: T2)*
-- [ ] **T8** `store.rs` — snapshot/TXID bookkeeping + retention. Port `store_test.go`. *(dep: T2)*
-- [ ] **T9** `db.rs` — checkpoint takeover, LTX capture loop, snapshot-on-continuity-break, clean shutdown. Port `db_test.go`, `db_internal_test.go`, `db_shutdown_test.go`. *(dep: T1, T2)*
+- [x] **T5** `client/mod.rs` — `ReplicaClient` trait + generic conformance suite. Port `replica_client_test.go`. *(dep: T2)* — *Done 2026-05-30 (inline): async `ReplicaClient` trait (type/init/ltx_files/open_ltx_file/write_ltx_file/delete_ltx_files/delete_all) + `ltx::FileInfo` + the generic `run_client_suite` (empty/write/list-order/seek/full+partial reads/size==0-EOF/not-found/delete/delete_all) + `make_test_ltx_file`. `// DECISION:` buffered I/O for KEEP scope (logged in OPEN_QUESTIONS). Suite is exercised by T6 (passes).*
+- [ ] **T8** `store.rs` — snapshot/TXID bookkeeping + retention. Port `store_test.go`. *(dep: T2)* — **NEXT (Wave 2).**
+- [ ] **T9** `db.rs` — checkpoint takeover, LTX capture loop, snapshot-on-continuity-break, clean shutdown. Port `db_test.go`, `db_internal_test.go`, `db_shutdown_test.go`. *(dep: T1, T2)* — **HIGH RISK / largest task** (recon brief `docs/porting-briefs/T9.md`); plan to land in sub-steps.
 
 ## Wave 3 — clients
-- [ ] **T6** `client/file.rs` — passes conformance suite. Port `file/` tests. *(dep: T5)*
-- [ ] **T7** `client/object_store.rs` (S3/R2) — passes conformance suite vs MinIO. Port `s3/` tests. *(dep: T5)*
+- [x] **T6** `client/file.rs` — passes conformance suite. Port `file/` tests. *(dep: T5)* — *Done 2026-05-30 (inline): `FileReplicaClient` (atomic tmp-write+rename, `<root>/ltx/<level>/<min>-<max>.ltx` layout, listing sorted by txid + seek filter, partial reads). Passes `run_client_suite` AND lists+decodes the real golden replica (6 L0 files). Deferred: mtime/timestamp preservation (needs `filetime`) + `LTXError` not-found wrapping → noted in OPEN_QUESTIONS.*
+- [ ] **T7** `client/object_store.rs` (S3/R2) — passes conformance suite vs MinIO. Port `s3/` tests. *(dep: T5)* — **NEXT (Wave 3, needs MinIO);** recon brief `docs/porting-briefs/T7.md`.
 
 ## Wave 4 — replica  → **GATE G2 (round-trip)**
 - [ ] **T10** `replica.rs` — single-replica sync loop + restore. Port `replica_test.go`, `replica_internal_test.go`. *(dep: T8, T9, T5)*

@@ -55,6 +55,24 @@ Non-blocking: crate/repo name `rustyriver`; no debug CLI in the one-shot.
 > **Conservative choice taken (if any):** `// DECISION:` summary, or "STOPPED — needs human".
 > **Needs from human:** the specific answer required to proceed.
 
+### 2026-05-30 — T5/T6 — ReplicaClient I/O shape (DECISION) + two deferrals
+**Context:** `src/client/mod.rs`, `src/client/file.rs`. Ported from `replica_client.go` + `file/replica_client.go`.
+**DECISION — buffered I/O:** Go's `ReplicaClient` uses `io.Reader`/`io.ReadCloser`;
+the Rust trait takes `&[u8]` and returns `Vec<u8>`. The `(offset, size)` params on
+`open_ltx_file` keep the partial-read fast-path (page-index tail) the restore uses,
+so this is buffering, not lost capability. KEEP-scope L0 files are bounded; streaming
+large snapshots is a noted follow-on (revisit at T10/T11 if a large-DB path needs it).
+**Deferral 1 — timestamp preservation:** Go's file client `Chtimes` the file to the
+LTX header timestamp so listings return accurate `CreatedAt`. We compute `created_at`
+from the header in `write_ltx_file` but do **not** persist it as the file mtime
+(needs the `filetime` crate or a libc call). Affects timestamp-based PITR only; the
+TXID-based path is unaffected. Pick up with T7/T10 (log the dep then, rule 7).
+**Deferral 2 — `LTXError` not-found wrapping:** `open_ltx_file` currently returns the
+raw `Io(NotFound)` rather than `LTXError{op:"open",…}`. NotFound is preserved (so
+`is_auto_recoverable` still works); the structured wrap lands when the full upstream
+conformance suite (which asserts the `LTXError` type) is ported.
+**Needs from human:** none — recorded for visibility; revisit before G3 (differential).
+
 ### 2026-05-30 — T2 — New runtime dependency `lz4_flex` (rule 7) + the NoChecksum finding
 **Context:** `src/ltx.rs`, `Cargo.toml`. Ported from ltx@v0.5.1 `encoder.go`/`decoder.go`/`checksum.go`.
 **Dependency (AGENTS.md rule 7):** LTX page blocks are LZ4-**frame** compressed

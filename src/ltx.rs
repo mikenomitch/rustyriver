@@ -11,8 +11,9 @@
 //! differential test D1 (PLAN.md §6.3), not here.
 
 use crate::error::{Error, Result};
-use crate::{Checksum, CHECKSUM_FLAG, TXID};
+use crate::{Checksum, Pos, CHECKSUM_FLAG, TXID};
 use std::io::{Read, Write};
+use std::time::SystemTime;
 
 // ── Constants (ltx@v0.5.1 ltx.go:18-55) ──────────────────────────────────────
 
@@ -329,6 +330,40 @@ pub fn parse_filename(name: &str) -> Result<(TXID, TXID)> {
     let min = u64::from_str_radix(a, 16).map_err(|_| corrupt("invalid ltx filename"))?;
     let max = u64::from_str_radix(b, 16).map_err(|_| corrupt("invalid ltx filename"))?;
     Ok((TXID(min), TXID(max)))
+}
+
+// ── FileInfo ──────────────────────────────────────────────────────────────────
+
+/// Metadata about an LTX file on a replica. Ported from ltx@v0.5.1 ltx.go:571-596.
+///
+/// `pre_apply_checksum`/`post_apply_checksum` are populated when known (e.g. by
+/// decoding) and are zero when a file is discovered by a bare directory/bucket
+/// listing. `created_at` is the file's timestamp (mtime / LastModified, or the
+/// LTX header timestamp when `use_metadata` is requested).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FileInfo {
+    pub level: i32,
+    pub min_txid: TXID,
+    pub max_txid: TXID,
+    pub pre_apply_checksum: Checksum,
+    pub post_apply_checksum: Checksum,
+    pub size: i64,
+    pub created_at: Option<SystemTime>,
+}
+
+impl FileInfo {
+    /// Replication position *after* this file is applied (ltx.go:591-596).
+    pub fn pos(&self) -> Pos {
+        Pos::new(self.max_txid, self.post_apply_checksum)
+    }
+
+    /// Replication position *before* this file is applied (ltx.go:583-588).
+    pub fn pre_apply_pos(&self) -> Pos {
+        Pos::new(
+            TXID(self.min_txid.0.saturating_sub(1)),
+            self.pre_apply_checksum,
+        )
+    }
 }
 
 // ── Decoder ──────────────────────────────────────────────────────────────────
