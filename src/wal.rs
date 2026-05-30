@@ -98,6 +98,36 @@ pub enum WalError {
         /// The WAL's page size.
         want: u32,
     },
+
+    /// `offset (<n>) must be greater than the wal header size (<m>)` — passed to
+    /// [`WalReader::new_with_offset`] with an offset at or before the header.
+    ///
+    /// Ported from litestream@v0.5.11 wal_reader.go:48.
+    OffsetTooSmall {
+        /// The requested offset.
+        offset: i64,
+        /// The WAL header size.
+        header_size: i64,
+    },
+
+    /// `unaligned wal offset <n> for page size <m>` — the offset does not land on
+    /// a frame boundary.
+    ///
+    /// Ported from litestream@v0.5.11 wal_reader.go:64.
+    UnalignedOffset {
+        /// The requested offset.
+        offset: i64,
+        /// The WAL's page size.
+        page_size: u32,
+    },
+
+    /// The previous frame at the seek offset could not be re-read (its salt or
+    /// checksum did not match). **Load-bearing**: `DB.sync` catches this and
+    /// falls back to a full snapshot (db.go:1571-1577).
+    ///
+    /// Ported from `PrevFrameMismatchError` in litestream@v0.5.11
+    /// wal_reader.go:284-294.
+    PrevFrameMismatch,
 }
 
 impl WalError {
@@ -124,6 +154,17 @@ impl std::fmt::Display for WalError {
                 f,
                 "WALReader.ReadFrame(): buffer size ({got}) must match page size ({want})"
             ),
+            WalError::OffsetTooSmall {
+                offset,
+                header_size,
+            } => write!(
+                f,
+                "offset ({offset}) must be greater than the wal header size ({header_size})"
+            ),
+            WalError::UnalignedOffset { offset, page_size } => {
+                write!(f, "unaligned wal offset {offset} for page size {page_size}")
+            }
+            WalError::PrevFrameMismatch => f.write_str("previous frame mismatch"),
         }
     }
 }
@@ -202,6 +243,70 @@ impl<'a> WalReader<'a> {
             chksum2: 0,
         };
         r.read_header()?;
+        Ok(r)
+    }
+
+    /// Creates a new reader positioned at `offset`, loading the running checksum
+    /// from the *previous* frame so reading can resume mid-WAL.
+    ///
+    /// `salt1`/`salt2` are the expected salts of the segment being resumed; they
+    /// override the header salts in case the start of the file was overwritten by
+    /// a later transaction. Returns:
+    /// - [`WalError::OffsetTooSmall`] if `offset <= WAL_HEADER_SIZE` (we must be
+    ///   able to read a previous frame),
+    /// - [`WalError::UnalignedOffset`] if `offset` is not on a frame boundary,
+    /// - [`WalError::PrevFrameMismatch`] if the previous frame cannot be re-read
+    ///   (salt/checksum mismatch) — the caller falls back to a full snapshot.
+    ///
+    /// Ported from `NewWALReaderWithOffset` in litestream@v0.5.11
+    /// wal_reader.go:42-75.
+    pub fn new_with_offset(data: &'a [u8], offset: i64, salt1: u32, salt2: u32) -> WalResult<Self> {
+        // Must not start on the first page — we need to read the previous frame.
+        if offset <= WAL_HEADER_SIZE as i64 {
+            return Err(WalError::OffsetTooSmall {
+                offset,
+                header_size: WAL_HEADER_SIZE as i64,
+            });
+        }
+
+        let mut r = WalReader {
+            data,
+            frame_n: 0,
+            big_endian: false,
+            page_size: 0,
+            seq: 0,
+            salt1: 0,
+            salt2: 0,
+            chksum1: 0,
+            chksum2: 0,
+        };
+
+        // Read header to determine page size & byte order.
+        r.read_header()?;
+
+        // Override salts in case the beginning of the file was overwritten.
+        r.salt1 = salt1;
+        r.salt2 = salt2;
+
+        // Ensure the offset lands on a frame start.
+        let frame_size = r.page_size as i64 + WAL_FRAME_HEADER_SIZE as i64;
+        if (offset - WAL_HEADER_SIZE as i64) % frame_size != 0 {
+            return Err(WalError::UnalignedOffset {
+                offset,
+                page_size: r.page_size,
+            });
+        }
+        r.frame_n = (offset - WAL_HEADER_SIZE as i64) / frame_size;
+
+        // Read the previous frame to load the running checksum. Any failure here
+        // (salt/checksum mismatch surfaces as WalError::Eof from read_frame_inner)
+        // means the previous frame doesn't match what we expect → mismatch.
+        r.frame_n -= 1;
+        let mut buf = vec![0u8; r.page_size as usize];
+        if r.read_frame_inner(&mut buf, false).is_err() {
+            return Err(WalError::PrevFrameMismatch);
+        }
+
         Ok(r)
     }
 
@@ -680,6 +785,79 @@ mod tests {
         let mut buf = vec![0u8; 4096];
         let err = r.read_frame(&mut buf).expect_err("expected EOF");
         assert!(err.is_eof(), "unexpected error: {err}");
+    }
+
+    // ── new_with_offset (port of NewWALReaderWithOffset, wal_reader.go:42-75) ──
+    //
+    // Resuming at a frame boundary must load the running checksum from the
+    // previous frame and continue reading the rest of the WAL identically to a
+    // fresh full read. We cross-check against a from-start read of the same WAL.
+    #[test]
+    fn test_wal_reader_new_with_offset_resumes() {
+        let b = read_testdata("ok");
+        let page_size = 4096i64;
+        let frame_size = WAL_FRAME_HEADER_SIZE as i64 + page_size;
+
+        // Header salts (offsets 16/20) are the segment's expected salts.
+        let salt1 = be_u32(&b[16..]);
+        let salt2 = be_u32(&b[20..]);
+
+        // Resume at the SECOND frame: offset = 32 + 1*frame_size. This requires
+        // re-reading frame 0 to seed the checksum.
+        let offset = WAL_HEADER_SIZE as i64 + frame_size;
+        let mut r = WalReader::new_with_offset(&b, offset, salt1, salt2)
+            .expect("new_with_offset at frame 1");
+
+        // The next frame read should be frame index 1 (the second frame), whose
+        // page/commit match what a full read returns for that frame.
+        let mut buf = vec![0u8; page_size as usize];
+        let (pgno, commit) = r.read_frame(&mut buf).expect("resume frame");
+        assert_eq!(pgno, 2, "second frame pgno");
+        assert_eq!(commit, 2, "second frame commit");
+        assert_eq!(&buf[..], &b[4176..8272], "resumed page data matches");
+    }
+
+    #[test]
+    fn test_wal_reader_new_with_offset_too_small() {
+        let b = read_testdata("ok");
+        let salt1 = be_u32(&b[16..]);
+        let salt2 = be_u32(&b[20..]);
+        // Offset at the header is rejected (need a previous frame to re-read).
+        let err = WalReader::new_with_offset(&b, WAL_HEADER_SIZE as i64, salt1, salt2)
+            .expect_err("expected offset-too-small");
+        assert_eq!(
+            err,
+            WalError::OffsetTooSmall {
+                offset: WAL_HEADER_SIZE as i64,
+                header_size: WAL_HEADER_SIZE as i64
+            }
+        );
+    }
+
+    #[test]
+    fn test_wal_reader_new_with_offset_unaligned() {
+        let b = read_testdata("ok");
+        let salt1 = be_u32(&b[16..]);
+        let salt2 = be_u32(&b[20..]);
+        // An offset off the frame grid is rejected.
+        let err = WalReader::new_with_offset(&b, WAL_HEADER_SIZE as i64 + 7, salt1, salt2)
+            .expect_err("expected unaligned");
+        assert!(
+            matches!(err, WalError::UnalignedOffset { .. }),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_wal_reader_new_with_offset_prev_frame_mismatch() {
+        let b = read_testdata("ok");
+        let frame_size = WAL_FRAME_HEADER_SIZE as i64 + 4096;
+        let offset = WAL_HEADER_SIZE as i64 + frame_size;
+        // Wrong expected salts → the previous frame won't validate → mismatch
+        // (the load-bearing snapshot-fallback signal for DB.sync).
+        let err = WalReader::new_with_offset(&b, offset, 0xdead_beef, 0xfeed_face)
+            .expect_err("expected prev-frame mismatch");
+        assert_eq!(err, WalError::PrevFrameMismatch);
     }
 
     // ── Port of TestWALReader_FrameSaltsUntil/OK (wal_reader_test.go:249-278) ──

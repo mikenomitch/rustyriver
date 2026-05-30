@@ -486,6 +486,82 @@ pub fn decode_file(bytes: &[u8]) -> Result<DecodedFile> {
     })
 }
 
+/// Decodes and verifies a complete LTX file, returning each page's
+/// `(pgno, decompressed_data)` in write order.
+///
+/// This reuses [`decode_file`] for full verification (file checksum + page
+/// index) and then re-walks the page block to materialize the page bytes —
+/// needed by `DB.verify`'s `lastPageMatch` check (db.go:1457-1474), which
+/// compares a WAL page against the pages stored in the last LTX file.
+pub fn decode_file_pages(bytes: &[u8]) -> Result<Vec<(u32, Vec<u8>)>> {
+    // Full verification first (also guarantees the index/geometry are sound).
+    decode_file(bytes)?;
+
+    let len = bytes.len();
+    let header = Header::parse(&bytes[0..HEADER_SIZE])?;
+    let page_size = header.page_size as usize;
+
+    let size_field_off = len - TRAILER_SIZE - 8;
+    let index_size = u64_be(&bytes[size_field_off..]) as usize;
+    let idx_start = size_field_off
+        .checked_sub(index_size)
+        .ok_or_else(|| corrupt("bad page index size"))?;
+    let index = parse_page_index(&bytes[idx_start..size_field_off])?;
+    let empty_header_off = idx_start - PAGE_HEADER_SIZE;
+
+    let mut out = Vec::new();
+    let mut off = HEADER_SIZE;
+    let mut scratch = vec![0u8; page_size];
+    while off < empty_header_off {
+        let ph = PageHeader::parse(&bytes[off..off + PAGE_HEADER_SIZE])?;
+        let elem = index
+            .get(&ph.pgno)
+            .ok_or_else(|| corrupt("page missing from index"))?;
+        let sz = elem.size as usize;
+        decompress_page(&bytes[off + PAGE_HEADER_SIZE..off + sz], &mut scratch)?;
+        out.push((ph.pgno, scratch.clone()));
+        off += sz;
+    }
+    Ok(out)
+}
+
+/// Reconstructs the full SQLite database image from a **snapshot** LTX file
+/// (every page `1..=commit`, with the lock page zero-filled).
+///
+/// Ported from `Decoder.DecodeDatabaseTo` in ltx@v0.5.1 decoder.go:223-268. Used
+/// by the snapshot conformance test (the CRC64 of this image must equal the live
+/// DB's CRC64). Errors if the file is not a snapshot or a page is missing.
+pub fn decode_database_image(bytes: &[u8]) -> Result<Vec<u8>> {
+    let header = Header::parse(&bytes[0..HEADER_SIZE])?;
+    if !header.is_snapshot() {
+        return Err(corrupt(
+            "cannot decode non-snapshot LTX file to SQLite database",
+        ));
+    }
+    let page_size = header.page_size as usize;
+    let lock = lock_pgno(header.page_size);
+
+    // Materialize the pages, keyed by page number.
+    let pages = decode_file_pages(bytes)?;
+    let mut by_pgno: std::collections::HashMap<u32, Vec<u8>> = std::collections::HashMap::new();
+    for (pgno, data) in pages {
+        by_pgno.insert(pgno, data);
+    }
+
+    let mut image = Vec::with_capacity(header.commit as usize * page_size);
+    for pgno in 1..=header.commit {
+        if pgno == lock {
+            image.extend(std::iter::repeat_n(0u8, page_size));
+            continue;
+        }
+        let data = by_pgno
+            .get(&pgno)
+            .ok_or_else(|| corrupt("missing page in snapshot"))?;
+        image.extend_from_slice(data);
+    }
+    Ok(image)
+}
+
 /// Decompresses one LZ4 frame holding exactly one page into `out`.
 fn decompress_page(compressed: &[u8], out: &mut [u8]) -> Result<()> {
     let mut fd = lz4_flex::frame::FrameDecoder::new(compressed);

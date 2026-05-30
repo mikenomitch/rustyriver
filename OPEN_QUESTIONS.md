@@ -48,6 +48,64 @@ Non-blocking: crate/repo name `rustyriver`; no debug CLI in the one-shot.
 
 ## Escalations log (agent appends; newest first)
 
+### 2026-05-30 — T9 — Async/blocking shape (DECISION: synchronous `Db`) + two-connection read-lock + deferrals
+**Context:** `src/db.rs` (the WAL→LTX capture loop + checkpoint takeover). Ported from `db.go`.
+**DECISION — synchronous `Db` (footgun F-1 / brief §2 shape choice):** The brief offered
+(A) a dedicated DB thread or (B) `spawn_blocking`+`Mutex<Connection>` for the `!Sync`
+`rusqlite::Connection` + the borrowing read-tx. I took the third option the **task brief
+explicitly sanctions**: keep the capture API **synchronous** and let T10 drive it. `Db`
+owns the connection(s) directly; the long-running read transaction is held with raw
+`BEGIN`/`ROLLBACK` SQL plus a `read_lock_held` flag (exactly Go's `acquireReadLock`/
+`releaseReadLock`, not a borrowing `rusqlite::Transaction`). This sidesteps the
+!Sync/borrow problem entirely, makes the idempotent double-release (issue #934) a trivial
+flag check, and keeps `verify`/`sync`/`checkpoint` as a faithful branch-for-branch port.
+`&mut self` serializes sync/checkpoint/snapshot, so the upstream `chkMu` snapshot-vs-
+checkpoint gate (footgun F-3) is unnecessary; T10 preserves this by giving the `Db` a
+single owner (one blocking thread / `spawn_blocking`).
+**Discovery — two connections, mirroring Go's `*sql.DB` pool (load-bearing):** Go's `db.db`
+is a **connection pool**: the read lock (`db.rtx`) lives on one pooled connection while
+every other `db.db.Exec` (the `_litestream_seq` write after a checkpoint, the
+`_litestream_lock` write-lock grab) runs on a *different* pooled connection. A single
+`rusqlite::Connection` cannot replicate that — an `INSERT` on the same connection that
+holds the read transaction is buffered in that transaction and is **not flushed to the
+WAL** (so it would not write a fresh WAL page after a TRUNCATE checkpoint, breaking the
+two-phase restart detection in `checkpoint`, db.go:1828-1842). Fix: `Db` holds **two**
+connections — `conn` (writes/PRAGMAs/checkpoints) and a dedicated `rtx_conn` (the read
+lock). Verified by spike + the `checkpoint_does_not_trigger_snapshot{,_passive,_truncate}`
+and `crc64` tests. Not a new dependency; just the faithful pool model.
+**Finding (not an ambiguity) — SQLite checkpoint pragmas don't error on busy:** a
+`PRAGMA wal_checkpoint(<mode>)` blocked by a reader/writer returns `Ok((1, …))` (busy flag
+in column 0), **not** an `Err`. So `isSQLiteBusyError` (footgun F-6) matters for the
+*surrounding* ops (the post-checkpoint `INSERT`/`BEGIN`), which is exactly what
+`checkpoint_passive_swallowing_busy` wraps — faithful to db.go:1117-1125 wrapping the whole
+`db.checkpoint` call. Real rusqlite busy errors carry "database is locked", which the
+classifier matches.
+**Deferrals (logged, not on the functional capture path; land with T10's `Replica`):**
+1. **PERSIST_WAL** (`setPersistWAL`, the `unsafe` `sqlite3_file_control(SQLITE_FCNTL_PERSIST_WAL)`
+   FFI, footgun F-10): only matters when *all* connections close and SQLite would delete
+   the WAL on last close. The capture path keeps `conn`+`rtx_conn` open, so the WAL persists
+   for the process lifetime. Revisit in T10 (process-restart durability) — likely the
+   crate's one `unsafe` block; justify per AGENTS.md rule 6 or find a safe rusqlite path.
+2. **Background monitor loop + backoff** (footgun F-13) and **`Replica` integration**
+   (`ensure_exists`/`sync_status`/`sync_and_wait`/`syncReplicaWithRetry`/`Done`/the
+   `EnforceL0RetentionByTime`+`EnforceSnapshotRetention` driver, the 8 shutdown subtests,
+   `checkDatabaseBehindReplica` #781): all need T10's `Replica` handle / `ReplicaClient`
+   upload. The *selection* logic already exists (T8 `store.rs`); T9 exposes the local-half
+   primitives (`sync`/`checkpoint`/`snapshot_to_writer`/`crc64`/`pos`/`reset_local_state`)
+   the `Replica` will call. `Db::close` here releases the read lock + closes the conn; the
+   replica final-sync + retry wrap it in T10.
+3. **`loom` model of the lock protocol** + the real-SQLite concurrent-checkpoint page-gap
+   race (`TestDB_CheckpointPageGapWithConcurrentWrites`, `TestDB_ConcurrentMapWrite`):
+   the synchronous `&mut self` design has no intra-`Db` data race to model; the
+   cross-process WAL race is a T11 integration concern once T10 wires the monitor.
+4. **Prometheus metric assertions** in the upstream white-box tests: DROPPED (host owns
+   telemetry, PLAN.md §2) — ported the *behavior* (sync/checkpoint succeed/err), not the
+   counter asserts. **L1+ compaction tests** (`TestDB_Compact*`): DEFER (out of L0 scope).
+   Record both in the T17 coverage report.
+**Needs from human:** none — conservative, tested choices throughout; recorded for
+visibility and to route the PERSIST_WAL `unsafe` + Replica-integration tests to T10.
+
+
 > Format:
 > ### YYYY-MM-DD — T<id> — <one-line title>
 > **Context:** what code/path, which upstream ref.
