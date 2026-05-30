@@ -20,7 +20,12 @@ categories = ["database"]
 # Dropped clients are re-addable here later (PLAN.md §2).
 [features]
 default = ["s3"]
-s3 = ["object_store/aws"]
+# `s3` also enables `reqwest` so the optional HeartbeatClient (T15) can issue its
+# liveness GET. `reqwest` is already a transitive dependency of `object_store/aws`
+# with the SAME feature set declared below, so enabling it here adds no new crate
+# to the build graph — it only makes the existing dependency callable from this
+# crate. Logged in OPEN_QUESTIONS.md (AGENTS.md rule 7).
+s3 = ["object_store/aws", "dep:reqwest"]
 gcs = ["object_store/gcp"]
 azure = ["object_store/azure"]
 
@@ -39,6 +44,11 @@ futures = "0.3"
 # Lease object + config are JSON (PLAN.md §1 fencing).
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Optional HTTP client for the T15 HeartbeatClient liveness ping. Optional and
+# gated behind the `s3` feature; feature set matches object_store/aws's own
+# reqwest dependency exactly so it unifies with the already-compiled copy (no new
+# crate in the graph). Logged in OPEN_QUESTIONS.md (AGENTS.md rule 7).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "http2"], optional = true }
 # LTX page blocks are LZ4-frame compressed (ltx@v0.5.1 encoder.go uses
 # pierrec/lz4 v4). lz4_flex is pure-Rust (no CGo) → fits the single-static-binary
 # goal (D-4 rationale). Added in T2; logged in OPEN_QUESTIONS.md (AGENTS.md rule 7).

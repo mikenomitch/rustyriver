@@ -1333,6 +1333,7 @@ dependencies = [
  "lz4_flex",
  "object_store",
  "proptest",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde_json",

@@ -48,6 +48,98 @@ Non-blocking: crate/repo name `rustyriver`; no debug CLI in the one-shot.
 
 ## Escalations log (agent appends; newest first)
 
+### 2026-05-30 — T15 — Leaser (lease fencing): conditional-DELETE deviation + RFC3339 serde + reqwest dep + deferrals
+**Context:** `src/leaser.rs` (the object-storage lease acquire/renew/release +
+expiry→failover primitive), `Cargo.toml` (+ optional `reqwest`). Behavior ported
+from `leaser.go` + `heartbeat.go` + `s3/leaser.go`; the transport is the
+**`object_store` crate** (the same abstraction T7 uses), not the Go AWS SDK.
+
+**DECISION — `ReleaseLease` is read-then-delete (object_store 0.11 has no
+conditional DELETE).** Go's `ReleaseLease` issues `DeleteObject{IfMatch:<etag>}`
+(s3/leaser.go:180-184). `object_store 0.11`'s `delete(&path)` takes no options and
+has no conditional-delete variant (the brief T15.md §3 flags this as the biggest
+correctness risk). I chose the brief's safest option — **read the current lock
+object + ETag, compare to the held lease's ETag, then delete** — which reproduces
+all three Go outcomes exactly: absent→`LeaseAlreadyReleased` (Go 404), ETag
+mismatch→`LeaseNotHeld` (Go 412), match→delete (NotFound during the delete is
+treated as success). The ~1-RTT TOCTOU window is benign under the single-owner
+model (brief §5.11): the lock object can only move off our unique ETag if *we*
+renew it, and a node about to release is not concurrently renewing the same
+handle, so no other node can mutate the object out from under the read→delete. A
+`// DEVIATION from Go` comment marks the source. (Marked `// DECISION` in the
+module header.)
+
+**DECISION — both `AlreadyExists` and `Precondition` map to `LeaseExistsError` in
+`writeLease`.** Go maps `isPreconditionFailed` (HTTP 412) → `&LeaseExistsError{}`
+for *both* the `If-None-Match:*` create-conflict and the `If-Match` mismatch
+(s3/leaser.go:254-256). In `object_store`, a losing `PutMode::Create` surfaces as
+`Error::AlreadyExists` (S3 returns 412, but the InMemory store and some backends
+distinguish it) while a losing `PutMode::Update` surfaces as `Error::Precondition`.
+The brief (§5.1) requires mapping BOTH; I match-arm both into the blank
+`LeaseExistsError` the acquire/renew callers then handle (re-read to enrich, or
+→`LeaseNotHeld`). A bug here would let two writers both believe they hold the
+lease — so this is the load-bearing CAS arm, covered by the active-lease,
+412-reread, lost-renew, and 10-way concurrent tests.
+
+**DECISION — self-contained RFC3339Nano serde for `Lease.expires_at`
+(`SystemTime`), at nanosecond precision, no date crate.** Go marshals
+`Lease.ExpiresAt` (`time.Time`) as RFC-3339 (`time.RFC3339Nano`). serde_json's
+default `SystemTime` serializer uses epoch-float, NOT RFC-3339 (brief §5.8), so a
+custom `#[serde(with = "rfc3339")]` module emits/parses `…Z` UTC with up-to-9-digit
+trailing-zero-trimmed fractional seconds (Howard Hinnant civil-date math, same
+algorithm the T7 timestamp helper uses). I made it **nanosecond**-precise (the T7
+helper is millis-only) because `SystemTime::now()+ttl` carries sub-ms precision and
+must round-trip; and self-contained (no `chrono`/`time` direct dep) to match the
+T7 precedent (this log, 2026-05-30 T7). The lock object is rustyriver-internal
+(read back only by this same code, brief §3), and any RFC-3339 string we emit is
+also parseable by Go's `time.RFC3339Nano`, so cross-version compat holds.
+Round-trip + Go-style-timestamp-parse + exact-JSON-shape are unit-tested.
+
+**Dependency (AGENTS.md rule 7) — `reqwest` for the `HeartbeatClient` GET, gated on
+`s3`.** `heartbeat.go`'s `Ping` does an HTTP GET. `reqwest` is **already** a
+transitive dependency of `object_store/aws` (feature `s3`) with features
+`["rustls-tls-native-roots","http2"]`. I declared it as an **optional** direct dep
+with the identical feature set and enabled it from the `s3` feature, so it unifies
+with the already-compiled copy: **`Cargo.lock` gained exactly 1 line (`"reqwest"`
+under the rustyriver package) and 0 new packages.** The throttle state machine
+(`should_ping`/`record_ping`/`last_ping_at`) + the `MinHeartbeatInterval` clamp are
+always available and tested; the actual GET in `ping()` is `#[cfg(feature="s3")]`,
+with a `#[cfg(not(feature="s3"))]` fallback that still honours the empty-URL no-op
+and returns an explicit error (never a silent no-op) for a non-empty URL. Verified:
+`--no-default-features` build + clippy + the 24 non-HTTP leaser tests all green.
+
+**Concurrency proof without MinIO.** The PLAN.md T15 gate ("two contenders →
+exactly one primary; expiry → failover") is proven against `object_store::InMemory`,
+whose `put_opts` holds a single `RwLock<Storage>` write lock across the
+check-and-insert, making `PutMode::Create` a genuine atomic CAS. `TestLeaser_
+ConcurrentAcquisition`'s 10-way race is ported verbatim (exactly 1 success, 9
+`LeaseExistsError`), plus an `expiry_failover_standby_takes_over` test (1 ms TTL →
+standby acquires gen 2 → deposed primary's renew → `LeaseNotHeld`). A MinIO mirror
+is the natural T13/integration follow-on (the same `object_store` transport is
+already exercised live by T7's `integration_minio.rs`); not re-run here because
+InMemory is a faithful CAS and the logic is transport-agnostic.
+
+**DEFERRED (logged, NOT on the T15 functional path):**
+1. **Live-MinIO leaser integration test.** The fencing logic is transport-agnostic
+   and fully proven over the in-memory CAS store; T7 already covers the
+   `object_store` S3/MinIO transport end-to-end. A MinIO-backed two-contender test
+   would add transport coverage but no new fencing-logic coverage. Revisit at T13
+   (differential) if a MinIO-specific CAS/ETag-quoting gap is suspected.
+2. **Wiring the `Leaser` into the replica write path.** Brief §6 step 15-F. The
+   `Replica` (T10) write loop is synchronous-`Db`-driven and has no live monitor
+   task yet (T10/T11 deferred the background monitor + backoff). The leaser is a
+   complete, standalone, tested primitive ready for that integration; gating the
+   actual "acquire-before-write / stand-by-on-`LeaseExistsError`" call belongs with
+   the background runtime task, not this unit. No earlier task depends on it.
+3. **`context.Context` cancellation.** The brief (§2 table) sanctions a bare
+   no-arg first pass; the trait methods take no ctx. A `CancellationToken` parameter
+   is an additive change for the runtime-integration follow-on.
+**Needs from human:** none — conservative, tested choices throughout; the one
+correctness-critical arm (the dual `AlreadyExists`/`Precondition`→`LeaseExistsError`
+mapping) and the read-then-delete deviation are both covered by ported Go tests
+plus the concurrency/failover gates. The `reqwest` dep is recorded for visibility
+(adds 0 packages).
+
 ### 2026-05-30 — T11+12+14 — Resilience/property/fault-injection suites: the issue #781 fix lands + deferrals
 **Context:** `tests/integration_resilience.rs` (T11), `tests/property_roundtrip.rs`
 (T12), `tests/faults_inject.rs` (T14); new production code in `src/replica.rs`
