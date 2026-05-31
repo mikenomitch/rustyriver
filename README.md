@@ -3,9 +3,13 @@
 An embeddable Rust library for **streaming replication of a SQLite database to
 object storage**, with point-in-time restore and object-storage lease fencing.
 
-This is an experimental port of [Litestream v0.5](https://github.com/benbjohnson/litestream)
+This is a spiritual port of [Litestream v0.5](https://github.com/benbjohnson/litestream)
 to Rust but uses an an in-process async API instead of a sidecar binary.
 Credit to benbjohnson and [Litestream](https://github.com/benbjohnson/litestream) for the original implementation.
+
+This is being used for a fun personal project and was done mostly as an experiment to see how
+far I could push [Claude Dynamic Workflows](https://code.claude.com/docs/en/workflows) for a non-trivial
+project. It is *very* agent-driven, so I would take everything (code/comments/PRs) with a grain of salt.
 
 ## Embedding guide
 
