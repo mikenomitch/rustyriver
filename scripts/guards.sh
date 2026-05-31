@@ -17,17 +17,22 @@ else
   echo "ok"
 fi
 
-echo "== Guard 2: golden fixtures not edited alongside src/ =="
+echo "== Guard 2: existing golden fixtures not modified/deleted alongside src/ =="
 base="${1:-}"
 if [ -n "$base" ] && git rev-parse --verify "$base" >/dev/null 2>&1; then
-  changed=$(git diff --name-only "$base"...HEAD)
+  range="$base...HEAD"
 else
-  changed=$(git diff --name-only HEAD~1...HEAD 2>/dev/null || true)
+  range="HEAD~1...HEAD"
 fi
-touched_golden=$(echo "$changed" | grep -E '^tests/fixtures/golden/' || true)
-touched_src=$(echo "$changed"    | grep -E '^src/' || true)
+# ADDING captured fixtures (e.g. the initial import that introduces both the
+# golden vectors and src/, or a later legitimate capture) is allowed. The
+# immutability rule (AGENTS.md rule 3) protects EXISTING fixtures from being
+# edited/deleted/renamed to match buggy code — so flag only Modified, Deleted,
+# or Renamed golden files (--diff-filter=MDR), never plain Additions.
+touched_golden=$(git diff --name-status --diff-filter=MDR "$range" -- 'tests/fixtures/golden/' 2>/dev/null || true)
+touched_src=$(git diff --name-only "$range" -- 'src/' 2>/dev/null || true)
 if [ -n "$touched_golden" ] && [ -n "$touched_src" ]; then
-  echo "ERROR: golden fixtures changed in the same change as src/ — fixtures are immutable (AGENTS.md rule 3)."
+  echo "ERROR: existing golden fixtures modified/deleted in the same change as src/ — fixtures are immutable (AGENTS.md rule 3)."
   echo "golden touched:"; echo "$touched_golden"
   fail=1
 else
