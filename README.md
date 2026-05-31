@@ -1,15 +1,11 @@
 # rustyriver
 
 An embeddable Rust library for **streaming replication of a SQLite database to
-object storage**, with point-in-time restore and object-storage lease fencing —
-a from-scratch Rust reimplementation of **Litestream v0.5** (pinned `v0.5.11`,
-Apache-2.0, see [NOTICE](NOTICE)) as an in-process async API instead of a
-sidecar binary.
+object storage**, with point-in-time restore and object-storage lease fencing.
 
-> Status: **under construction** via the task DAG in [`PLAN.md`](PLAN.md). This is
-> a wire-compatible port (D-1), differentially tested against the real
-> `litestream` binary. The one-shot scope is **L0-only** (no compaction), single
-> replica, file + S3 clients, and lease fencing.
+This is an experimental port of [Litestream v0.5](https://github.com/benbjohnson/litestream)
+to Rust but uses an an in-process async API instead of a sidecar binary.
+Credit to benbjohnson and [Litestream](https://github.com/benbjohnson/litestream) for the original implementation.
 
 ## Embedding guide
 
