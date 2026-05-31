@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Documentation Issues
+    url: https://github.com/benbjohnson/litestream.io/issues/new/choose
+    about: Report documentation bugs or suggest improvements
+  - name: Documentation
+    url: https://litestream.io
+    about: Check our documentation for setup and usage guides

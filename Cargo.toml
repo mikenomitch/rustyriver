@@ -3,7 +3,7 @@ name = "rustyriver"
 version = "0.0.0"
 edition = "2021"
 # MSRV pinned for CI determinism (PLAN.md D-10). Keep in sync with rust-toolchain.toml.
-rust-version = "1.84"
+rust-version = "1.90"
 license = "Apache-2.0"
 description = "Embeddable streaming replication for SQLite to object storage (a Rust reimplementation of Litestream v0.5)."
 repository = "https://github.com/OWNER/rustyriver"
@@ -11,11 +11,21 @@ readme = "README.md"
 keywords = ["sqlite", "replication", "litestream", "backup", "ha"]
 categories = ["database"]
 
+# Explicit workspace root: this crate lives in a git worktree nested under the
+# parent repo, which carries its own stray Cargo.toml. Declaring [workspace]
+# here stops cargo from walking up and adopting that ancestor manifest.
+[workspace]
+
 # Default client set per PLAN.md D-7 (S3/R2 + file). File works with no feature.
 # Dropped clients are re-addable here later (PLAN.md §2).
 [features]
 default = ["s3"]
-s3 = ["object_store/aws"]
+# `s3` also enables `reqwest` so the optional HeartbeatClient (T15) can issue its
+# liveness GET. `reqwest` is already a transitive dependency of `object_store/aws`
+# with the SAME feature set declared below, so enabling it here adds no new crate
+# to the build graph — it only makes the existing dependency callable from this
+# crate. Logged in OPEN_QUESTIONS.md (AGENTS.md rule 7).
+s3 = ["object_store/aws", "dep:reqwest"]
 gcs = ["object_store/gcp"]
 azure = ["object_store/azure"]
 
@@ -34,6 +44,15 @@ futures = "0.3"
 # Lease object + config are JSON (PLAN.md §1 fencing).
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Optional HTTP client for the T15 HeartbeatClient liveness ping. Optional and
+# gated behind the `s3` feature; feature set matches object_store/aws's own
+# reqwest dependency exactly so it unifies with the already-compiled copy (no new
+# crate in the graph). Logged in OPEN_QUESTIONS.md (AGENTS.md rule 7).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "http2"], optional = true }
+# LTX page blocks are LZ4-frame compressed (ltx@v0.5.1 encoder.go uses
+# pierrec/lz4 v4). lz4_flex is pure-Rust (no CGo) → fits the single-static-binary
+# goal (D-4 rationale). Added in T2; logged in OPEN_QUESTIONS.md (AGENTS.md rule 7).
+lz4_flex = { version = "0.11", features = ["frame"] }
 
 # NOTE: WAL uses SQLite's custom checksum (no crate); LTX uses a CRC the T2 spike
 # pins. Add the chosen checksum crate in T1/T2 and log it in OPEN_QUESTIONS.md

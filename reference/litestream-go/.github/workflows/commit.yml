@@ -1,0 +1,610 @@
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+
+name: Commit
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+
+      - run: |
+          go install golang.org/x/tools/cmd/goimports@latest
+          go install honnef.co/go/tools/cmd/staticcheck@latest
+          export PATH="$HOME/go/bin:$PATH"
+
+      - uses: pre-commit/action@v3.0.0
+
+  vfs-build-test:
+    name: VFS Build Test (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+
+      - name: Build VFS shared library
+        run: make vfs
+
+      - name: Verify shared library created
+        run: file dist/litestream-vfs.so
+
+  vfs-build-test-linux:
+    name: VFS Build Test (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+
+      - name: Build VFS Linux AMD64
+        run: make vfs-linux-amd64
+
+      - name: Verify shared library created
+        run: file dist/litestream-vfs-linux-amd64.so
+
+  build-windows:
+    name: Build Windows
+    runs-on: ubuntu-latest
+    steps:
+      - run: sudo apt-get install -y mingw-w64
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+
+      - run: |
+          go build ./cmd/litestream/
+          file ./litestream.exe
+        env:
+          CGO_ENABLED: "1"
+          GOOS: windows
+          GOARCH: amd64
+          CC: x86_64-w64-mingw32-gcc
+
+  docker-smoke-test:
+    name: Docker Smoke Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build default image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: default
+          push: false
+          load: true
+          tags: litestream:default
+
+      - name: Build hardened image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: hardened
+          push: false
+          load: true
+          tags: litestream:hardened
+
+      - name: "Default: verify version command"
+        run: docker run --rm litestream:default version
+
+      - name: "Hardened: verify version command"
+        run: docker run --rm litestream:hardened version
+
+      - name: "Hardened: verify non-root user (UID 65532)"
+        run: |
+          user=$(docker inspect --format='{{.Config.User}}' litestream:hardened)
+          echo "Container user: $user"
+          if [ "$user" != "nonroot:nonroot" ]; then
+            echo "FAIL: Expected user 'nonroot:nonroot', got '$user'"
+            exit 1
+          fi
+          docker create --name uid-check litestream:hardened version
+          uid=$(docker export uid-check | tar -xf - --to-stdout etc/passwd | grep '^nonroot:' | cut -d: -f3)
+          docker rm uid-check
+          echo "nonroot UID: $uid"
+          if [ "$uid" != "65532" ]; then
+            echo "FAIL: Expected UID 65532, got '$uid'"
+            exit 1
+          fi
+
+      - name: "Hardened: verify no shell exists"
+        run: |
+          if docker run --rm --entrypoint /bin/sh litestream:hardened -c "echo hello" 2>/dev/null; then
+            echo "FAIL: Shell should not exist in scratch image"
+            exit 1
+          fi
+          echo "PASS: No shell in scratch image"
+
+      - name: "Hardened: verify CA certificates present"
+        run: |
+          docker create --name cert-check litestream:hardened version
+          docker export cert-check | tar -tf - | grep -q "etc/ssl/certs/ca-certificates.crt"
+          echo "PASS: CA certificates found"
+          docker rm cert-check
+
+  build:
+    name: Build & Unit Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+
+      - run: go env
+
+      - run: go install ./cmd/litestream
+
+      - run: go build -o /dev/null ./_examples/library/basic
+      - run: go build -o /dev/null ./_examples/library/s3
+      - run: go test -v ./_examples/library
+
+      - run: go test -v .
+      - run: go test -v ./internal
+      - run: go test -v ./abs
+      - run: go test -v ./file
+      - run: go test -v ./gs
+      - run: go test -v ./nats
+      - run: go test -v ./s3
+      - run: go test -v ./sftp
+      - run: go test -v ./cmd/litestream
+
+
+  ltx-behavioral-gate:
+    name: LTX Behavioral Gate (short)
+    runs-on: ubuntu-latest
+    needs: build
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+
+      - name: Build binaries
+        run: |
+          go build -o bin/litestream ./cmd/litestream
+          go build -o bin/litestream-test ./cmd/litestream-test
+
+      - name: Run LTX behavioral tests (short mode)
+        env:
+          LOG_LEVEL: DEBUG
+        run: |
+          go test -tags 'integration,soak' \
+            -run '^TestLTXBehavior$' \
+            -short -v -timeout 15m \
+            ./tests/integration/
+
+  s3-mock-test:
+    name: Run S3 Mock Tests
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+#         cache: 'pip'
+      - run: pip install moto[s3,server]
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+
+      - run: go env
+
+      - run: go install ./cmd/litestream
+
+      - run: ./etc/s3_mock.py go test -v ./replica_client_test.go -integration s3
+
+  minio-integration-test:
+    name: Run MinIO Integration Tests
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+
+      - name: Start MinIO Server
+        run: |
+          docker run -d \
+            --name minio-test \
+            -p 9000:9000 \
+            -p 9001:9001 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            quay.io/minio/minio server /data --console-address ":9001"
+
+          # Wait for MinIO to be ready
+          echo "Waiting for MinIO server to be ready..."
+          for i in {1..30}; do
+            if docker exec minio-test mc alias set local http://localhost:9000 minioadmin minioadmin 2>/dev/null; then
+              echo "MinIO server is ready"
+              break
+            fi
+            echo "Waiting for MinIO server... ($i/30)"
+            sleep 1
+          done
+
+          # Create test bucket
+          docker exec minio-test mc mb local/testbucket
+
+      - run: go install ./cmd/litestream
+
+      - name: Test Query Parameter Support
+        run: |
+          # Create test database
+          sqlite3 /tmp/test.db "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT); INSERT INTO users (name) VALUES ('Alice'), ('Bob');"
+
+          # Test replicate with query parameters
+          export AWS_ACCESS_KEY_ID=minioadmin
+          export AWS_SECRET_ACCESS_KEY=minioadmin
+
+          # Run replication for 5 seconds
+          timeout 5 litestream replicate /tmp/test.db \
+            "s3://testbucket/test.db?endpoint=localhost:9000&forcePathStyle=true" || true
+
+          # Verify files were uploaded
+          docker exec minio-test mc ls local/testbucket/test.db/
+
+          # Test restore with query parameters
+          rm -f /tmp/restored.db
+          litestream restore -o /tmp/restored.db \
+            "s3://testbucket/test.db?endpoint=localhost:9000&forcePathStyle=true"
+
+          # Verify restored data
+          if [ "$(sqlite3 /tmp/restored.db 'SELECT COUNT(*) FROM users;')" != "2" ]; then
+            echo "ERROR: Restored database does not have expected data"
+            exit 1
+          fi
+
+          echo "MinIO integration test with query parameters passed!"
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker stop minio-test || true
+          docker rm minio-test || true
+
+  nats-docker-test:
+    name: Run NATS Integration Tests
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+
+      - name: Start NATS Server with JetStream
+        run: |
+          docker run -d \
+            --name nats-test \
+            -p 4222:4222 \
+            -p 8222:8222 \
+            nats:latest \
+            -js \
+            -DV
+
+          # Wait for NATS to be ready
+          echo "Waiting for NATS server to be ready..."
+          for i in {1..30}; do
+            if nc -z localhost 4222; then
+              echo "NATS server is ready"
+              break
+            fi
+            echo "Waiting for NATS server... ($i/30)"
+            sleep 1
+          done
+
+      - name: Create NATS Object Store Bucket
+        run: |
+          # Install NATS CLI - get latest version using jq for JSON parsing
+          NATS_VERSION=$(curl -fsSL -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            https://api.github.com/repos/nats-io/natscli/releases/latest \
+            | jq -r '.tag_name' \
+            | sed 's/^v//')
+          if [ -z "$NATS_VERSION" ] || [ "$NATS_VERSION" = "null" ]; then
+            NATS_VERSION="0.3.1"
+            echo "Warning: Failed to fetch latest NATS CLI version, using fallback v${NATS_VERSION}"
+          fi
+          wget "https://github.com/nats-io/natscli/releases/download/v${NATS_VERSION}/nats-${NATS_VERSION}-linux-amd64.zip" -O nats.zip
+          unzip nats.zip
+          sudo mv "nats-${NATS_VERSION}-linux-amd64/nats" /usr/local/bin/
+          sudo chmod +x /usr/local/bin/nats
+
+          # Create the object store bucket
+          nats object add litestream-test --max-bucket-size=100M --replicas=1
+
+      - run: go env
+
+      - run: go install ./cmd/litestream
+
+      - run: go test -v ./replica_client_test.go -integration nats
+        env:
+          LITESTREAM_NATS_URL: "nats://localhost:4222"
+          LITESTREAM_NATS_BUCKET: "litestream-test"
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker stop nats-test || true
+          docker rm nats-test || true
+
+  s3-integration-test:
+    name: Run S3 Integration Tests
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    concurrency:
+      group: integration-test-s3
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+
+      - run: go env
+
+      - run: go install ./cmd/litestream
+
+      - run: go test -v ./replica_client_test.go -integration s3
+        env:
+          LITESTREAM_S3_ACCESS_KEY_ID: ${{ secrets.LITESTREAM_S3_ACCESS_KEY_ID }}
+          LITESTREAM_S3_SECRET_ACCESS_KEY: ${{ secrets.LITESTREAM_S3_SECRET_ACCESS_KEY }}
+          LITESTREAM_S3_REGION: us-east-1
+          LITESTREAM_S3_BUCKET: integration.litestream.io
+
+  gcp-integration-test:
+    name: Run GCP Integration Tests
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    concurrency:
+      group: integration-test-gcp
+    steps:
+      - name: Extract GCP credentials
+        run: 'echo "$GOOGLE_APPLICATION_CREDENTIALS" > /opt/gcp.json'
+        shell: bash
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: ${{secrets.GOOGLE_APPLICATION_CREDENTIALS}}
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+
+      - run: go env
+
+      - run: go install ./cmd/litestream
+
+      - run: go test -v ./replica_client_test.go -integration gs
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS:  /opt/gcp.json
+          LITESTREAM_GS_BUCKET:           integration.litestream.io
+
+  abs-integration-test:
+    name: Run Azure Blob Store Integration Tests
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    concurrency:
+      group: integration-test-abs
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+
+      - run: go env
+
+      - run: go install ./cmd/litestream
+
+      - run: go test -v ./replica_client_test.go -integration abs
+        env:
+          LITESTREAM_ABS_ACCOUNT_NAME:     ${{ secrets.LITESTREAM_ABS_ACCOUNT_NAME }}
+          LITESTREAM_ABS_ACCOUNT_KEY:      ${{ secrets.LITESTREAM_ABS_ACCOUNT_KEY }}
+          LITESTREAM_ABS_BUCKET:           integration
+
+  r2-integration-test:
+    name: Run Cloudflare R2 Integration Tests
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    concurrency:
+      group: integration-test-r2
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+
+      - run: go env
+
+      - run: go install ./cmd/litestream
+
+      - run: go test -v ./replica_client_test.go -integration -replica-clients=r2
+        env:
+          LITESTREAM_R2_ACCESS_KEY_ID: ${{ secrets.LITESTREAM_R2_ACCESS_KEY_ID }}
+          LITESTREAM_R2_SECRET_ACCESS_KEY: ${{ secrets.LITESTREAM_R2_SECRET_ACCESS_KEY }}
+          LITESTREAM_R2_ENDPOINT: ${{ secrets.LITESTREAM_R2_ENDPOINT }}
+          LITESTREAM_R2_BUCKET: ${{ secrets.LITESTREAM_R2_BUCKET }}
+
+  sftp-integration-test:
+    name: Run SFTP Integration Tests
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Prepare OpenSSH server
+        run: |-
+          sudo mkdir -p /test/etc/ssh /test/home /run/sshd /test/data/
+          sudo ssh-keygen -t ed25519 -f /test/etc/ssh/id_ed25519_host -N ""
+          sudo ssh-keygen -t ed25519 -f /test/etc/ssh/id_ed25519 -N ""
+          sudo chmod 0600 /test/etc/ssh/id_ed25519_host /test/etc/ssh/id_ed25519
+          sudo chmod 0644 /test/etc/ssh/id_ed25519_host.pub /test/etc/ssh/id_ed25519.pub
+          sudo cp /test/etc/ssh/id_ed25519 /test/id_ed25519
+          sudo chown $USER /test/id_ed25519
+          sudo tee /test/etc/ssh/sshd_config <<EOF
+          Port 2222
+          HostKey /test/etc/ssh/id_ed25519_host
+          AuthorizedKeysFile /test/etc/ssh/id_ed25519.pub
+          AuthenticationMethods publickey
+          Subsystem sftp internal-sftp
+          UsePAM no
+          LogLevel DEBUG
+          EOF
+          sudo /usr/sbin/sshd -e -f /test/etc/ssh/sshd_config -E /test/debug.log
+
+      - name: Test OpenSSH server works with pubkey auth
+        run: ssh -v -i /test/id_ed25519 -o StrictHostKeyChecking=accept-new -p 2222 root@localhost whoami || (sudo cat /test/debug.log && exit 1)
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+
+      - run: go env
+
+      - run: go install ./cmd/litestream
+
+      - run: go test -v ./replica_client_test.go -integration sftp
+        env:
+          LITESTREAM_SFTP_HOST:     "localhost:2222"
+          LITESTREAM_SFTP_USER:     "root"
+          LITESTREAM_SFTP_KEY_PATH: /test/id_ed25519
+          LITESTREAM_SFTP_PATH:     /test/data
+
+      - name: Test SFTP with concurrent writes enabled (default)
+        run: |
+          cat > /tmp/sftp-concurrent.yml <<EOF
+          dbs:
+            - path: /tmp/test-concurrent.db
+              replica:
+                type: sftp
+                host: localhost:2222
+                key-path: /test/id_ed25519
+                user: root
+                path: /test/data/concurrent
+                concurrent-writes: true
+          EOF
+
+          # Create test database
+          sqlite3 /tmp/test-concurrent.db <<SQL
+          CREATE TABLE test (id INTEGER PRIMARY KEY, data TEXT);
+          INSERT INTO test (data) VALUES ('test1'), ('test2'), ('test3');
+          SQL
+
+          # Run replication briefly
+          timeout 5 ./bin/litestream replicate -config /tmp/sftp-concurrent.yml || true
+
+          # Check files were created
+          ssh -i /test/id_ed25519 -o StrictHostKeyChecking=accept-new -p 2222 root@localhost "ls -la /test/data/concurrent/" || true
+
+      - name: Test SFTP with concurrent writes disabled
+        run: |
+          cat > /tmp/sftp-sequential.yml <<EOF
+          dbs:
+            - path: /tmp/test-sequential.db
+              replica:
+                type: sftp
+                host: localhost:2222
+                key-path: /test/id_ed25519
+                user: root
+                path: /test/data/sequential
+                  concurrent-writes: false
+          EOF
+
+          # Create test database
+          sqlite3 /tmp/test-sequential.db <<SQL
+          CREATE TABLE test (id INTEGER PRIMARY KEY, data TEXT);
+          INSERT INTO test (data) VALUES ('test1'), ('test2'), ('test3');
+          SQL
+
+          # Run replication briefly
+          timeout 5 ./bin/litestream replicate -config /tmp/sftp-sequential.yml || true
+
+          # Check files were created
+          ssh -i /test/id_ed25519 -o StrictHostKeyChecking=accept-new -p 2222 root@localhost "ls -la /test/data/sequential/" || true
+
+  webdav-integration-test:
+    name: Run WebDAV Integration Tests
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Start WebDAV Server
+        run: |
+          docker run -d \
+            --name webdav-test \
+            -p 8080:80 \
+            -e USERNAME=testuser \
+            -e PASSWORD=testpass \
+            -v /tmp/webdav:/var/webdav \
+            bytemark/webdav
+
+          # Wait for WebDAV to be ready
+          for i in {1..30}; do
+            if curl -s -u testuser:testpass http://localhost:8080/ >/dev/null 2>&1; then
+              echo "WebDAV server is ready"
+              break
+            fi
+            sleep 1
+          done
+
+          # Verify WebDAV is accessible
+          curl -u testuser:testpass http://localhost:8080/ || (docker logs webdav-test && exit 1)
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+
+      - run: go env
+
+      - run: go install ./cmd/litestream
+
+      - run: go test -v ./replica_client_test.go -integration webdav
+        env:
+          LITESTREAM_WEBDAV_URL:      "http://localhost:8080"
+          LITESTREAM_WEBDAV_USERNAME: "testuser"
+          LITESTREAM_WEBDAV_PASSWORD: "testpass"
+          LITESTREAM_WEBDAV_PATH:     "/testdata"
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker stop webdav-test || true
+          docker rm webdav-test || true

@@ -1,0 +1,29 @@
+.DS_Store
+/src/litestream-vfs.h
+/dist
+.vscode
+.sprite
+
+# Claude-related files (force include despite global gitignore)
+!.claude/
+!.claude/**
+# But ignore logs, hooks, and local settings
+.claude/logs/
+.claude/hooks/
+.claude/settings.local.json
+# Keep CLAUDE.md ignored as it's auto-loaded by Claude Code
+CLAUDE.md
+
+# Binary
+bin/
+
+# Cached binaries for integration tests
+.cache/
+.claude/*.loop.local.md
+.claude/worktrees/
+CLAUDE.local.md
+
+# Package manager build artifacts
+packages/python/dist/
+packages/python/build/
+packages/python/*.egg-info/

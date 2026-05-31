@@ -1,6 +1,9 @@
-# Pinned for CI determinism (PLAN.md D-10). Bump to latest stable at seed time
-# if desired; CI installs exactly this channel via `rustup show`.
+# Pinned for CI determinism (PLAN.md D-10). Seeded at 1.90.0: the modern
+# dependency tree (getrandom, hashbrown, icu_*, proptest, security-framework)
+# requires Rust 1.85+/edition-2024 support. Our crate stays edition 2021; the
+# toolchain only needs to be new enough to BUILD those deps. CI installs exactly
+# this channel via `rustup show`.
 [toolchain]
-channel = "1.84.0"
+channel = "1.90.0"
 components = ["rustfmt", "clippy"]
 profile = "minimal"

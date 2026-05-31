@@ -1,0 +1,19 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Local tooling (the real litestream binary built from reference/, etc.)
+/.tools
+
+# Scratch DBs / replicas from local test runs
+*.db
+*.db-wal
+*.db-shm
+/scratch
+
+# Claude Code local settings / nested worktrees (personal — not committed)
+/.claude
+
+# OS
+.DS_Store

@@ -1,0 +1,34 @@
+# AWS credentials
+# access-key-id:     AKIAxxxxxxxxxxxxxxxx
+# secret-access-key: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx/xxxxxxxxx
+
+# Control socket for runtime start/stop commands
+# socket:
+#   enabled: true                          # Enable control socket (default: false)
+#   path: /var/run/litestream.sock         # Socket path (default: /var/run/litestream.sock)
+#   permissions: 0600                      # Socket file permissions (default: 0600)
+
+# dbs:
+#  - path: /path/to/primary/db            # Database to replicate from
+#    replica:
+#      path: /path/to/replica             # File-based replication
+#      url:  s3://my.bucket.com/db        # S3-based replication
+#      # Example Fly.io Tigris setup (signing/no-Content-MD5 are auto-enabled for this endpoint)
+#      # url: s3://my-tigris-bucket/db.sqlite?endpoint=fly.storage.tigris.dev&region=auto
+#      type: nats                         # NATS JetStream replication
+#      url: nats://nats.example.com:4222
+#      bucket: litestream-backups
+#      # Optional TLS configuration:
+#      # client-cert: /path/to/client.pem
+#      # client-key: /path/to/client.key
+#      # root-cas: [/path/to/ca.pem]
+#  - path: /path/to/another/db
+#    replica:
+#      url: sftp://user@host:22/path      # SFTP-based replication
+#      key-path: /etc/litestream/sftp_key
+#      # Strongly recommended: SSH host key for verification
+#      # Get this from the server's /etc/ssh/ssh_host_*.pub file
+#      # or use `ssh-keyscan hostname`
+#      # Example formats:
+#      # host-key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMvvypUkBrS9RCyV//p+UFCLg8yKNtTu/ew/cV6XXAAP
+#      # host-key: ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQ...
