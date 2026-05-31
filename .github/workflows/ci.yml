@@ -49,13 +49,20 @@ jobs:
           "$RUNNER_TEMP/mc" alias set local "$AWS_ENDPOINT" "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY"
           "$RUNNER_TEMP/mc" mb -p "local/$RUSTYRIVER_TEST_BUCKET"
 
-      - name: Install litestream (differential oracle, D-3)
+      - name: Install Go (to build the pinned litestream from source)
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      - name: Install litestream from source (differential oracle, D-3)
         run: |
-          # NOTE: confirm the exact asset name for the pinned release.
-          url="https://github.com/benbjohnson/litestream/releases/download/v${LITESTREAM_VERSION}/litestream-v${LITESTREAM_VERSION}-linux-amd64.tar.gz"
-          curl -sSL "$url" -o "$RUNNER_TEMP/litestream.tar.gz"
-          sudo tar -C /usr/local/bin -xzf "$RUNNER_TEMP/litestream.tar.gz" litestream
-          litestream version
+          # benbjohnson/litestream publishes no prebuilt linux-amd64 asset for
+          # v${LITESTREAM_VERSION}, so build the pinned binary from source (the
+          # same way the local dev environment does). Go's toolchain directive in
+          # litestream's go.mod auto-selects the exact compiler it needs.
+          go install "github.com/benbjohnson/litestream/cmd/litestream@v${LITESTREAM_VERSION}"
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          "$(go env GOPATH)/bin/litestream" version
 
       - name: fmt
         run: cargo fmt --all --check
