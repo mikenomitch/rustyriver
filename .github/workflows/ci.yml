@@ -15,7 +15,12 @@ env:
   AWS_REGION: us-east-1
   AWS_ENDPOINT: http://127.0.0.1:9000
   AWS_ALLOW_HTTP: "true"
-  RUSTYRIVER_TEST_BUCKET: rustyriver-test
+  # The MinIO integration tests (tests/integration_minio.rs) read these exact
+  # variable names; the bucket must match what we create below (default is
+  # `litestream`). Mismatched names previously left the tests looking for a
+  # bucket that did not exist (NoSuchBucket).
+  RUSTYRIVER_MINIO_ENDPOINT: http://127.0.0.1:9000
+  RUSTYRIVER_MINIO_BUCKET: litestream
 
 jobs:
   gate:
@@ -47,7 +52,7 @@ jobs:
           curl -sSL https://dl.min.io/client/mc/release/linux-amd64/mc -o "$RUNNER_TEMP/mc"
           chmod +x "$RUNNER_TEMP/mc"
           "$RUNNER_TEMP/mc" alias set local "$AWS_ENDPOINT" "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY"
-          "$RUNNER_TEMP/mc" mb -p "local/$RUSTYRIVER_TEST_BUCKET"
+          "$RUNNER_TEMP/mc" mb -p "local/$RUSTYRIVER_MINIO_BUCKET"
 
       - name: Install Go (to build the pinned litestream from source)
         uses: actions/setup-go@v5
