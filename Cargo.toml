@@ -1,15 +1,27 @@
 [package]
 name = "rustyriver"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2021"
 # MSRV pinned for CI determinism (PLAN.md D-10). Keep in sync with rust-toolchain.toml.
 rust-version = "1.90"
 license = "Apache-2.0"
 description = "Embeddable streaming replication for SQLite to object storage (a Rust reimplementation of Litestream v0.5)."
-repository = "https://github.com/OWNER/rustyriver"
+repository = "https://github.com/mikenomitch/rustyriver"
 readme = "README.md"
 keywords = ["sqlite", "replication", "litestream", "backup", "ha"]
 categories = ["database"]
+# Published package = the library + its docs. Excludes the vendored upstream
+# (reference/, 5.7M), golden fixtures, and the project-management docs.
+include = [
+    "/src/**",
+    "/examples/embed.rs",
+    "/README.md",
+    "/LICENSE",
+    "/NOTICE",
+]
+
+[package.metadata.docs.rs]
+all-features = true
 
 # Explicit workspace root: this crate lives in a git worktree nested under the
 # parent repo, which carries its own stray Cargo.toml. Declaring [workspace]
